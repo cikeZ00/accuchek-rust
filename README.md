@@ -173,10 +173,6 @@ ACCUCHEK_DBG=1 ./accuchek sync
 - `chrono` - Date/time handling
 - `serde`/`serde_json` - JSON serialization
 
-## License
-
-MIT License - Same as the original C++ project.
-
 ## Credits
 
 Ported from the original C++ implementation. Protocol reverse-engineered from the [Tidepool uploader](https://github.com/tidepool-org/uploader/tree/master/lib/drivers/roche).
