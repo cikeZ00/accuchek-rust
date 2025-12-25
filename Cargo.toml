@@ -1,6 +1,6 @@
 [package]
 name = "accuchek"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Download samples from Roche Accu-Chek blood glucose meters via USB"
 authors = ["Ported from C++ original"]
