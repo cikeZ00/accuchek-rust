@@ -13,6 +13,9 @@
 //!
 //! On Linux, requires root privileges. On Windows, requires proper USB driver (WinUSB/libusb).
 
+// Hide console window on Windows when running GUI mode (doesn't affect CLI when run from terminal)
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod protocol;
 mod device;
 mod config;
@@ -28,8 +31,51 @@ use crate::config::{Config, default_database_path, ensure_data_dir, config_file_
 use crate::error::AccuChekError;
 use crate::storage::Storage;
 
+/// Attach to parent console on Windows (needed for CLI output with windows_subsystem = "windows")
+/// This redirects stdout/stderr to the parent console when running from a terminal.
+#[cfg(windows)]
+fn attach_console() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn AttachConsole(dw_process_id: u32) -> i32;
+    }
+    
+    #[link(name = "msvcrt")]
+    extern "C" {
+        fn freopen(filename: *const i8, mode: *const i8, stream: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+        fn __acrt_iob_func(index: u32) -> *mut std::ffi::c_void;
+    }
+    
+    const ATTACH_PARENT_PROCESS: u32 = 0xFFFFFFFF;
+    
+    unsafe {
+        // Try to attach to the parent console (e.g., PowerShell, cmd)
+        if AttachConsole(ATTACH_PARENT_PROCESS) != 0 {
+            let conout = b"CONOUT$\0".as_ptr() as *const i8;
+            let mode_w = b"w\0".as_ptr() as *const i8;
+            
+            // Redirect stdout (stream 1) and stderr (stream 2) to console
+            freopen(conout, mode_w, __acrt_iob_func(1)); // stdout
+            freopen(conout, mode_w, __acrt_iob_func(2)); // stderr
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn attach_console() {
+    // No-op on non-Windows platforms
+}
+
 fn main() -> Result<(), AccuChekError> {
     let args: Vec<String> = env::args().collect();
+    
+    // Check if we're in CLI mode (any arguments passed)
+    let cli_mode = args.len() > 1;
+    
+    // Attach to parent console on Windows for CLI output
+    if cli_mode {
+        attach_console();
+    }
     
     // Check for debug mode
     let debug_mode = env::var("ACCUCHEK_DBG").is_ok();
