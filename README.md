@@ -108,9 +108,6 @@ $env:ACCUCHEK_DBG=1; cargo run --release
 ACCUCHEK_DBG=1 cargo run --release
 ```
 
-## License
-
-Same as the original C++ project.
 
 ## Credits
 
