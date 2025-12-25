@@ -1,0 +1,71 @@
+name: Build Windows Production Binary
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Extract version from Cargo.toml
+        id: get_version
+        shell: powershell
+        run: |
+          $version = (Get-Content -Path Cargo.toml | Select-String -Pattern '^version = "([^"]*)"').Matches.Groups[1].Value
+          echo "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Upload Release Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: accuchek-windows
+          path: target/release/accuchek.exe
+
+      - name: Create GitHub Release
+        if: github.event_name == 'push'
+        id: create_release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: "v${{ steps.get_version.outputs.version }}"
+          name: "Release v${{ steps.get_version.outputs.version }}"
+          body: |
+            ## Accu-Chek USB Downloader v${{ steps.get_version.outputs.version }}
+            
+            Download blood glucose data from Roche Accu-Chek devices via USB.
+            
+            ### Windows Installation
+            1. Download `accuchek.exe` below
+            2. Install [Zadig](https://zadig.akeo.ie/) and set up WinUSB driver for your device
+            3. Run `accuchek.exe`
+            
+            ### Changes
+            Release generated from commit ${{ github.sha }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Release Asset
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: "v${{ steps.get_version.outputs.version }}"
+          files: target/release/accuchek.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

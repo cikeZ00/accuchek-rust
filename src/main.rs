@@ -6,7 +6,10 @@
 //! Cross-platform: Works on Windows and Linux.
 //!
 //! Usage:
-//!   ACCUCHEK_DBG=1 accuchek [device_index]
+//!   accuchek              - Launch GUI
+//!   accuchek sync         - Download from device (CLI mode)
+//!   accuchek --help       - Show help
+//!   ACCUCHEK_DBG=1 accuchek sync - Enable debug output
 //!
 //! On Linux, requires root privileges. On Windows, requires proper USB driver (WinUSB/libusb).
 
@@ -14,14 +17,20 @@ mod protocol;
 mod device;
 mod config;
 mod error;
+mod storage;
+mod gui;
+mod export;
 
 use std::env;
 use log::{info, warn};
 use crate::device::find_and_operate_accuchek;
-use crate::config::Config;
+use crate::config::{Config, default_database_path, ensure_data_dir, config_file_path};
 use crate::error::AccuChekError;
+use crate::storage::Storage;
 
 fn main() -> Result<(), AccuChekError> {
+    let args: Vec<String> = env::args().collect();
+    
     // Check for debug mode
     let debug_mode = env::var("ACCUCHEK_DBG").is_ok();
     
@@ -32,35 +41,128 @@ fn main() -> Result<(), AccuChekError> {
             .init();
     }
 
+    // Ensure data directory exists
+    if let Err(e) = ensure_data_dir() {
+        eprintln!("Warning: Could not create data directory: {}", e);
+    }
+
+    // Create default config if it doesn't exist
+    let cfg_path = config_file_path();
+    if !cfg_path.exists() {
+        if let Err(e) = Config::create_default(&cfg_path) {
+            if debug_mode {
+                warn!("Could not create default config: {}", e);
+            }
+        }
+    }
+
+    // Try loading config from data directory first, then current directory
+    let config = Config::load(config_file_path())
+        .or_else(|_| Config::load("config.txt"))
+        .unwrap_or_else(|e| {
+            if debug_mode {
+                warn!("Could not load config: {}. Using defaults.", e);
+            }
+            Config::default()
+        });
+
+    // Use configured path or default OS-specific path
+    let db_path = config.database_path
+        .clone()
+        .unwrap_or_else(|| default_database_path().to_string_lossy().to_string());
+
+    // Parse command
+    match args.get(1).map(|s| s.as_str()) {
+        Some("sync") | Some("download") => {
+            // CLI sync mode
+            cmd_sync(&config, &db_path, args.get(2))?;
+        }
+        Some("--help") | Some("-h") | Some("help") => {
+            print_help();
+        }
+        Some("--version") | Some("-V") => {
+            println!("accuchek {}", env!("CARGO_PKG_VERSION"));
+        }
+        Some("path") | Some("paths") => {
+            cmd_show_paths();
+        }
+        _ => {
+            // Default: launch GUI
+            gui::run_gui(db_path).map_err(|e| {
+                AccuChekError::Communication(format!("GUI error: {}", e))
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Show data paths
+fn cmd_show_paths() {
+    use crate::config::{get_data_dir, default_export_dir};
+    
+    println!("Accu-Chek Data Paths:");
+    println!("  Data directory:  {}", get_data_dir().display());
+    println!("  Database:        {}", default_database_path().display());
+    println!("  Config file:     {}", config_file_path().display());
+    println!("  Export default:  {}", default_export_dir().display());
+}
+
+/// Sync from device (CLI mode)
+fn cmd_sync(config: &Config, db_path: &str, device_index: Option<&String>) -> Result<(), AccuChekError> {
     // On Unix, check for root privileges (not needed on Windows with proper driver)
     #[cfg(unix)]
     check_root_privileges()?;
 
-    // Load config file
-    let config = Config::load("config.txt").unwrap_or_else(|e| {
-        warn!("Could not load config.txt: {}. Using defaults.", e);
-        Config::default()
-    });
-
     info!("Starting Accu-Chek downloader");
 
-    // Parse device index from command line
-    let device_index: Option<usize> = env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok());
+    let device_index: Option<usize> = device_index.and_then(|s| s.parse().ok());
 
     // Initialize libusb context
     let context = rusb::Context::new()?;
     
     // Find and operate the device
-    let readings = find_and_operate_accuchek(&context, &config, device_index)?;
+    let readings = find_and_operate_accuchek(&context, config, device_index)?;
+
+    // Save to database
+    let storage = Storage::new(db_path)?;
+    let new_count = storage.import_readings(&readings)?;
+    let total_count = storage.count()?;
+    let skipped_count = readings.len() - new_count;
+    
+    info!("Imported {} new readings ({} from device, {} total in database)", 
+          new_count, readings.len(), total_count);
+
+    // Always print summary (not just in debug mode)
+    eprintln!("Downloaded {} readings from device", readings.len());
+    eprintln!("  New entries:     {}", new_count);
+    eprintln!("  Duplicates:      {} (skipped)", skipped_count);
+    eprintln!("  Total in DB:     {}", total_count);
+    eprintln!("Saved to: {}", db_path);
 
     // Output readings as JSON
     let json = serde_json::to_string_pretty(&readings)?;
     println!("{}", json);
 
-    info!("Done");
+    eprintln!("Export complete!");
     Ok(())
+}
+
+fn print_help() {
+    eprintln!("Accu-Chek USB Data Downloader v{}", env!("CARGO_PKG_VERSION"));
+    eprintln!();
+    eprintln!("USAGE:");
+    eprintln!("  accuchek                    Launch GUI application");
+    eprintln!("  accuchek sync [device_idx]  Download from device (CLI mode)");
+    eprintln!("  accuchek path               Show data file locations");
+    eprintln!("  accuchek help               Show this help");
+    eprintln!();
+    eprintln!("ENVIRONMENT:");
+    eprintln!("  ACCUCHEK_DBG=1              Enable debug output");
+    eprintln!();
+    eprintln!("DATA LOCATIONS:");
+    eprintln!("  Database:  {}", default_database_path().display());
+    eprintln!("  Config:    {}", config_file_path().display());
 }
 
 #[cfg(unix)]

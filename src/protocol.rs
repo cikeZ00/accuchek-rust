@@ -179,32 +179,34 @@ pub fn read_be32(buffer: &[u8], offset: usize) -> u32 {
 
 /// Hex dump a buffer for debugging
 pub fn hex_dump(buffer: &[u8]) {
+    use log::info;
+    
     let mut i = 0;
     while i < buffer.len() {
         let end = std::cmp::min(i + 16, buffer.len());
         
-        // Print hex bytes
+        // Build hex bytes string
+        let mut hex_part = String::new();
         for j in i..i + 16 {
             if j < buffer.len() {
-                print!("{:02X} ", buffer[j]);
+                hex_part.push_str(&format!("{:02X} ", buffer[j]));
             } else {
-                print!("   ");
+                hex_part.push_str("   ");
             }
         }
         
-        print!("   ");
-        
-        // Print ASCII representation
+        // Build ASCII representation
+        let mut ascii_part = String::new();
         for j in i..end {
             let c = buffer[j];
             if c.is_ascii_graphic() || c == b' ' {
-                print!("{}", c as char);
+                ascii_part.push(c as char);
             } else {
-                print!(".");
+                ascii_part.push('.');
             }
         }
         
-        println!();
+        info!("{}   {}", hex_part, ascii_part);
         i = i + 16;
     }
 }
@@ -218,5 +220,5 @@ pub fn hex_dump_with_header(name: &str, buffer: &[u8]) {
         buffer.len()
     );
     hex_dump(buffer);
-    println!("BUFFER END ============================================================================================\n");
+    log::info!("BUFFER END ============================================================================================\n");
 }

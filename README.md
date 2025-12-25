@@ -1,17 +1,26 @@
 # Accu-Chek USB Downloader (Rust Port)
 
-A cross-platform Rust implementation for downloading blood glucose data from Roche Accu-Chek devices via USB.
+A cross-platform Rust application for downloading and managing blood glucose data from Roche Accu-Chek devices via USB.
 
 ## Features
 
-- Cross-platform: Works on Windows and Linux
-- Uses the IEEE 11073 Personal Health Device (PHD) protocol
-- Outputs readings as JSON
-- Debug mode for troubleshooting
+- **Cross-platform**: Works on Windows, Linux, and macOS (probably. It's untested.)
+- **GUI Application**: Modern graphical interface with dashboard, readings list, and charts
+- **SQLite Database**: Persistent storage with notes and tags for each reading
+- **PDF Export**: Generate professional reports with statistics, charts, and data tables
+- **IEEE 11073 Protocol**: Uses the Personal Health Device (PHD) protocol
+- **CLI Mode**: Command-line interface for scripting and automation
+
+## Screenshots
+
+The application includes:
+- **Dashboard**: Overview with statistics, time-in-range, and recent readings
+- **Readings**: Searchable list with note/tag editing for each reading
+- **Charts**: Interactive glucose trend visualization
 
 ## Supported Devices
 
-The following devices are supported (add more in `config.txt`):
+The following devices are supported (add more in config file):
 
 - Roche Accu-Chek Guide (vendor: 0x173a, product: 0x21d5)
 - Roche Accu-Chek (vendor: 0x173a, product: 0x21d7)
@@ -43,46 +52,90 @@ The following devices are supported (add more in `config.txt`):
 ## Building
 
 ```bash
-cd RustPort
 cargo build --release
 ```
 
 ## Usage
 
+### GUI Mode (Default)
+
+Simply run the application to launch the graphical interface:
+
 ```bash
-# Basic usage (outputs JSON to stdout)
+# Launch GUI
 cargo run --release
 
-# With debug output
-ACCUCHEK_DBG=1 cargo run --release
-
-# Select specific device (if multiple connected)
-cargo run --release -- 0
+# Or run the built executable
+./target/release/accuchek      # Linux/macOS
+.\target\release\accuchek.exe  # Windows
 ```
+
+### CLI Mode
+
+```bash
+# Download from device and save to database
+accuchek sync
+
+# Show data file locations
+accuchek path
+
+# Show help
+accuchek help
+
+# With debug output
+ACCUCHEK_DBG=1 accuchek sync
+```
+
+## Data Storage
+
+Data is stored in OS-appropriate locations:
+
+| OS | Data Directory |
+|----|----------------|
+| Windows | `C:\Users\<user>\AppData\Roaming\accuchek\` |
+| Linux | `~/.local/share/accuchek/` |
+| macOS | `~/Library/Application Support/accuchek/` |
+
+Files stored:
+- `accuchek.db` - SQLite database with all readings, notes, and tags
+- `config.txt` - Configuration file (auto-created on first run)
+
+Run `accuchek path` to see exact locations on your system.
 
 ## Configuration
 
-Create a `config.txt` file in the working directory with whitelisted devices:
+A default `config.txt` is created automatically in the data directory on first run.
 
 ```
-vendor_0x173a_device_0x21d5 1 # Roche Accu-Chek Guide
-vendor_0x173a_device_0x21d7 1 # Another model
-vendor_0x173a_device_0x21d8 1 # Roche Relion Platinum
+# Device whitelist: vendor_0xXXXX_device_0xYYYY 1
+vendor_0x173a_device_0x21d5 1  # Accu-Chek model 929
+vendor_0x173a_device_0x21d7 1  # Accu-Chek model
+vendor_0x173a_device_0x21d8 1  # Relion Platinum model 982
+
+# Optional: Custom database path
+# database_path C:\path\to\custom\accuchek.db
 ```
 
-## Output Format
+## PDF Export
 
-```json
-[
-  {
-    "id": 0,
-    "epoch": 1735142400,
-    "timestamp": "2024/12/25 12:00",
-    "mg/dL": 95,
-    "mmol/L": 5.277778
-  }
-]
-```
+Export your data as a PDF report from the GUI (Dashboard tab → Export PDF). Reports include:
+- Summary statistics (average, min, max, reading count)
+- Time in range analysis with visual bars
+- Reading distribution breakdown
+- Glucose trend chart with threshold lines
+- Complete data table with notes and tags
+
+## Database Schema
+
+Readings are stored in SQLite with the following fields:
+- `id` - Unique identifier
+- `epoch` - Unix timestamp
+- `timestamp` - Human-readable date/time
+- `mg_dl` - Glucose in mg/dL
+- `mmol_l` - Glucose in mmol/L
+- `note` - User notes (editable in GUI)
+- `tags` - Comma-separated tags (e.g., "fasting,before_meal")
+- `imported_at` - When the reading was imported
 
 ## Troubleshooting
 
@@ -102,15 +155,27 @@ Set the `ACCUCHEK_DBG` environment variable to see detailed protocol traces:
 
 ```bash
 # Windows PowerShell
-$env:ACCUCHEK_DBG=1; cargo run --release
+$env:ACCUCHEK_DBG=1; .\accuchek.exe sync
 
 # Linux/macOS
-ACCUCHEK_DBG=1 cargo run --release
+ACCUCHEK_DBG=1 ./accuchek sync
 ```
+
+## Dependencies
+
+- `rusb` - USB communication
+- `rusqlite` - SQLite database
+- `eframe`/`egui` - GUI framework
+- `egui_plot` - Chart visualization
+- `printpdf` - PDF generation
+- `rfd` - Native file dialogs
+- `dirs` - OS-specific directories
+- `chrono` - Date/time handling
+- `serde`/`serde_json` - JSON serialization
 
 ## License
 
-Same as the original C++ project.
+MIT License - Same as the original C++ project.
 
 ## Credits
 

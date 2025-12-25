@@ -43,4 +43,7 @@ pub enum AccuChekError {
 
     #[error("Config parse error: {0}")]
     ConfigParse(String),
+
+    #[error("Storage error: {0}")]
+    Storage(#[from] rusqlite::Error),
 }
