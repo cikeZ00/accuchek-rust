@@ -134,8 +134,10 @@ impl AccuChekApp {
         thread::spawn(move || {
             let _ = tx.send(SyncMessage::Started);
             
-            // Load config
-            let config = Config::load("config.txt").unwrap_or_default();
+            // Load config from OS data directory first, then fallback to current directory
+            let config = Config::load(crate::config::config_file_path())
+                .or_else(|_| Config::load("config.txt"))
+                .unwrap_or_default();
             
             // Try to sync
             match rusb::Context::new() {
