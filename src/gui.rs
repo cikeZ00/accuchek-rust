@@ -1061,21 +1061,25 @@ impl AccuChekApp {
         ui.group(|ui| {
             ui.label(egui::RichText::new("Reading Distribution").heading());
             
-            // Count readings in ranges
-            let very_low = self.readings.iter().filter(|r| r.mg_dl < 54).count();
-            let low = self.readings.iter().filter(|r| r.mg_dl >= 54 && r.mg_dl < 70).count();
-            let normal = self.readings.iter().filter(|r| r.mg_dl >= 70 && r.mg_dl <= 180).count();
-            let high = self.readings.iter().filter(|r| r.mg_dl > 180 && r.mg_dl <= 250).count();
-            let very_high = self.readings.iter().filter(|r| r.mg_dl > 250).count();
+            // Clinical thresholds for dangerous levels (fixed)
+            const VERY_LOW_THRESHOLD: u16 = 54;  // Severe hypoglycemia
+            const VERY_HIGH_THRESHOLD: u16 = 250; // Risk of ketoacidosis
+            
+            // Count readings in ranges using configurable thresholds
+            let very_low = self.readings.iter().filter(|r| r.mg_dl < VERY_LOW_THRESHOLD).count();
+            let low = self.readings.iter().filter(|r| r.mg_dl >= VERY_LOW_THRESHOLD && r.mg_dl < self.low_threshold).count();
+            let normal = self.readings.iter().filter(|r| r.mg_dl >= self.low_threshold && r.mg_dl <= self.high_threshold).count();
+            let high = self.readings.iter().filter(|r| r.mg_dl > self.high_threshold && r.mg_dl <= VERY_HIGH_THRESHOLD).count();
+            let very_high = self.readings.iter().filter(|r| r.mg_dl > VERY_HIGH_THRESHOLD).count();
             
             let total = self.readings.len() as f32;
             
             let ranges = [
-                ("< 54 (Very Low)", very_low, egui::Color32::from_rgb(200, 50, 50)),
-                ("54-70 (Low)", low, egui::Color32::from_rgb(255, 100, 100)),
-                ("70-180 (Target)", normal, egui::Color32::from_rgb(100, 200, 100)),
-                ("180-250 (High)", high, egui::Color32::from_rgb(255, 180, 100)),
-                ("> 250 (Very High)", very_high, egui::Color32::from_rgb(255, 100, 50)),
+                (format!("< {} (Very Low)", VERY_LOW_THRESHOLD), very_low, egui::Color32::from_rgb(200, 50, 50)),
+                (format!("{}-{} (Low)", VERY_LOW_THRESHOLD, self.low_threshold - 1), low, egui::Color32::from_rgb(255, 100, 100)),
+                (format!("{}-{} (Target)", self.low_threshold, self.high_threshold), normal, egui::Color32::from_rgb(100, 200, 100)),
+                (format!("{}-{} (High)", self.high_threshold + 1, VERY_HIGH_THRESHOLD), high, egui::Color32::from_rgb(255, 180, 100)),
+                (format!("> {} (Very High)", VERY_HIGH_THRESHOLD), very_high, egui::Color32::from_rgb(255, 100, 50)),
             ];
             
             for (label, count, color) in ranges {
