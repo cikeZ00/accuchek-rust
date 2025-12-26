@@ -913,23 +913,20 @@ impl AccuChekApp {
                 .map(|(i, r)| [i as f64, r.mg_dl as f64])
                 .collect();
             
-            let line = Line::new(points)
-                .color(egui::Color32::from_rgb(100, 150, 255))
-                .name("Glucose");
+            let line = Line::new("Glucose", points)
+                .color(egui::Color32::from_rgb(100, 150, 255));
             
             // Reference lines for thresholds
-            let low_line = Line::new(PlotPoints::from_iter(
+            let low_line = Line::new(format!("Low ({})", self.low_threshold), PlotPoints::from_iter(
                 (0..self.readings.len()).map(|i| [i as f64, self.low_threshold as f64])
             ))
             .color(egui::Color32::from_rgb(255, 100, 100))
-            .name(format!("Low ({})", self.low_threshold))
             .style(egui_plot::LineStyle::dashed_dense());
             
-            let high_line = Line::new(PlotPoints::from_iter(
+            let high_line = Line::new(format!("High ({})", self.high_threshold), PlotPoints::from_iter(
                 (0..self.readings.len()).map(|i| [i as f64, self.high_threshold as f64])
             ))
             .color(egui::Color32::from_rgb(255, 180, 100))
-            .name(format!("High ({})", self.high_threshold))
             .style(egui_plot::LineStyle::dashed_dense());
             
             Plot::new("glucose_trend")
@@ -962,18 +959,15 @@ impl AccuChekApp {
                     .map(|(i, d)| [i as f64, d.max_mg_dl as f64])
                     .collect();
                 
-                let avg_line = Line::new(avg_points)
-                    .color(egui::Color32::from_rgb(100, 200, 100))
-                    .name("Average");
+                let avg_line = Line::new("Average", avg_points)
+                    .color(egui::Color32::from_rgb(100, 200, 100));
                 
-                let min_line = Line::new(min_points)
+                let min_line = Line::new("Min", min_points)
                     .color(egui::Color32::from_rgb(100, 100, 255))
-                    .name("Min")
                     .style(egui_plot::LineStyle::dashed_loose());
                 
-                let max_line = Line::new(max_points)
+                let max_line = Line::new("Max", max_points)
                     .color(egui::Color32::from_rgb(255, 100, 100))
-                    .name("Max")
                     .style(egui_plot::LineStyle::dashed_loose());
                 
                 Plot::new("daily_averages")
