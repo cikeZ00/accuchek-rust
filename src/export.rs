@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-use crate::storage::{StoredReading, TimeInRange, DailyStats};
+use crate::storage::{StoredReading, TimeInRange, DailyStats, HourlyStats, TimeBinStats, DailyTIR, HistogramBin};
 
 /// PDF document dimensions (A4)
 const PAGE_WIDTH_MM: f32 = 210.0;
@@ -33,6 +33,10 @@ pub fn export_to_pdf<P: AsRef<Path>>(
     daily_stats: &[DailyStats],
     low_threshold: u16,
     high_threshold: u16,
+    hourly_stats: &[HourlyStats],
+    time_bin_stats: &[TimeBinStats],
+    daily_tir: &[DailyTIR],
+    histogram_bins: &[HistogramBin],
 ) -> Result<(), String> {
     let mut doc = PdfDocument::new("Accu-Chek Glucose Report");
 
@@ -40,11 +44,27 @@ pub fn export_to_pdf<P: AsRef<Path>>(
     let summary_ops = build_summary_page(readings, time_in_range, low_threshold, high_threshold);
     let summary_page = PdfPage::new(Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), summary_ops);
 
-    // Page 2: Chart
+    // Page 2: Distribution Histogram
+    let histogram_ops = build_histogram_page(readings, histogram_bins, low_threshold, high_threshold);
+    let histogram_page = PdfPage::new(Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), histogram_ops);
+
+    // Page 3: Time-of-Day Analysis
+    let hourly_ops = build_hourly_page(hourly_stats, low_threshold, high_threshold);
+    let hourly_page = PdfPage::new(Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), hourly_ops);
+
+    // Page 4: Time Bins Boxplot
+    let time_bins_ops = build_time_bins_page(time_bin_stats, low_threshold, high_threshold);
+    let time_bins_page = PdfPage::new(Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), time_bins_ops);
+
+    // Page 5: Daily TIR Trend
+    let daily_tir_ops = build_daily_tir_page(daily_tir, low_threshold, high_threshold);
+    let daily_tir_page = PdfPage::new(Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), daily_tir_ops);
+
+    // Page 6: Glucose Trend Chart
     let chart_ops = build_chart_page(readings, daily_stats, low_threshold, high_threshold);
     let chart_page = PdfPage::new(Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), chart_ops);
 
-    let mut pages = vec![summary_page, chart_page];
+    let mut pages = vec![summary_page, histogram_page, hourly_page, time_bins_page, daily_tir_page, chart_page];
 
     // Data pages
     let readings_per_page = 35;
@@ -392,7 +412,7 @@ fn build_chart_page(
     ops.extend(text_ops(&format!("High ({})", high_threshold), 9.0, MARGIN_MM + 135.0, y, BuiltinFont::Helvetica, COLOR_BLACK));
 
     // Footer
-    ops.extend(text_ops("Page 2 - Chart", 8.0, MARGIN_MM, MARGIN_MM, BuiltinFont::Helvetica, COLOR_GRAY));
+    ops.extend(text_ops("Page 6 - Glucose Trend Chart", 8.0, MARGIN_MM, MARGIN_MM, BuiltinFont::Helvetica, COLOR_GRAY));
 
     ops
 }
@@ -511,7 +531,486 @@ fn build_data_page(
     }
 
     // Footer
-    ops.extend(text_ops(&format!("Page {} of {} - Data", page_num + 2, total_pages + 2), 8.0, MARGIN_MM, MARGIN_MM, BuiltinFont::Helvetica, COLOR_GRAY));
+    ops.extend(text_ops(&format!("Page {} of {} - Data", page_num + 6, total_pages + 6), 8.0, MARGIN_MM, MARGIN_MM, BuiltinFont::Helvetica, COLOR_GRAY));
+
+    ops
+}
+
+// ============= NEW VISUALIZATION PAGES =============
+
+fn build_histogram_page(
+    readings: &[StoredReading],
+    histogram_bins: &[HistogramBin],
+    low_threshold: u16,
+    high_threshold: u16,
+) -> Vec<Op> {
+    let mut ops = Vec::new();
+    let mut y = PAGE_HEIGHT_MM - MARGIN_MM;
+
+    // Title
+    ops.extend(text_ops("Glucose Distribution Histogram", 16.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, COLOR_BLACK));
+    y -= 8.0;
+    ops.extend(text_ops(&format!("n = {} readings | bin width = 20 mg/dL", readings.len()), 10.0, MARGIN_MM, y, BuiltinFont::Helvetica, COLOR_GRAY));
+    y -= 15.0;
+
+    if histogram_bins.is_empty() || readings.is_empty() {
+        ops.extend(text_ops("No data available", 12.0, MARGIN_MM, y, BuiltinFont::Helvetica, COLOR_GRAY));
+        return ops;
+    }
+
+    // Chart area
+    let chart_x = MARGIN_MM + 15.0;
+    let chart_y = y - 100.0;
+    let chart_width = PAGE_WIDTH_MM - 2.0 * MARGIN_MM - 20.0;
+    let chart_height = 80.0;
+
+    // Draw chart background
+    ops.extend(rect_fill_ops(chart_x, chart_y, chart_width, chart_height, COLOR_LIGHT_GRAY));
+    ops.extend(rect_stroke_ops(chart_x, chart_y, chart_width, chart_height, COLOR_BLACK, 0.5));
+
+    // Find max count for scaling
+    let max_count = histogram_bins.iter().map(|b| b.count).max().unwrap_or(1) as f32;
+    let num_bins = histogram_bins.len() as f32;
+    let bar_width = (chart_width - 10.0) / num_bins;
+
+    // Draw histogram bars
+    for (i, bin) in histogram_bins.iter().enumerate() {
+        let bar_height = (bin.count as f32 / max_count) * (chart_height - 10.0);
+        let bar_x = chart_x + 5.0 + i as f32 * bar_width;
+        let bar_y = chart_y + 5.0;
+
+        let color = if bin.range_end <= low_threshold {
+            COLOR_RED
+        } else if bin.range_start >= high_threshold {
+            COLOR_ORANGE
+        } else {
+            COLOR_GREEN
+        };
+
+        if bin.count > 0 {
+            ops.extend(rect_fill_ops(bar_x, bar_y, bar_width * 0.9, bar_height, color));
+            ops.extend(rect_stroke_ops(bar_x, bar_y, bar_width * 0.9, bar_height, COLOR_BLACK, 0.3));
+        }
+    }
+
+    // X-axis labels (every 4th bin)
+    y = chart_y - 5.0;
+    for (i, bin) in histogram_bins.iter().enumerate() {
+        if i % 4 == 0 {
+            let label_x = chart_x + 5.0 + i as f32 * bar_width;
+            ops.extend(text_ops(&format!("{}", bin.range_start), 6.0, label_x, y, BuiltinFont::Helvetica, COLOR_BLACK));
+        }
+    }
+    ops.extend(text_ops("mg/dL", 8.0, chart_x + chart_width / 2.0 - 10.0, y - 8.0, BuiltinFont::Helvetica, COLOR_BLACK));
+    
+    y -= 25.0;
+
+    // Statistics summary
+    ops.extend(text_ops("Distribution Statistics", 12.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, COLOR_BLACK));
+    y -= 10.0;
+
+    let values: Vec<f64> = readings.iter().map(|r| r.mg_dl as f64).collect();
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let mut sorted = values.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = sorted[sorted.len() / 2];
+    let variance: f64 = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (values.len() - 1) as f64;
+    let std_dev = variance.sqrt();
+    let se = std_dev / (values.len() as f64).sqrt();
+    let ci_low = mean - 1.96 * se;
+    let ci_high = mean + 1.96 * se;
+
+    ops.extend(text_ops(&format!("Mean: {:.1} mg/dL", mean), 10.0, MARGIN_MM + 5.0, y, BuiltinFont::Helvetica, COLOR_BLACK));
+    y -= 6.0;
+    ops.extend(text_ops(&format!("95% CI: {:.1} - {:.1} mg/dL", ci_low, ci_high), 10.0, MARGIN_MM + 5.0, y, BuiltinFont::Helvetica, COLOR_BLACK));
+    y -= 6.0;
+    ops.extend(text_ops(&format!("Median: {:.1} mg/dL", median), 10.0, MARGIN_MM + 5.0, y, BuiltinFont::Helvetica, COLOR_BLACK));
+    y -= 6.0;
+    ops.extend(text_ops(&format!("Standard Deviation: {:.1} mg/dL", std_dev), 10.0, MARGIN_MM + 5.0, y, BuiltinFont::Helvetica, COLOR_BLACK));
+    y -= 6.0;
+    ops.extend(text_ops(&format!("Range: {} - {} mg/dL", sorted[0] as u16, sorted[sorted.len()-1] as u16), 10.0, MARGIN_MM + 5.0, y, BuiltinFont::Helvetica, COLOR_BLACK));
+
+    // Footer
+    ops.extend(text_ops("Page 2 - Distribution Histogram", 8.0, MARGIN_MM, MARGIN_MM, BuiltinFont::Helvetica, COLOR_GRAY));
+
+    ops
+}
+
+fn build_hourly_page(
+    hourly_stats: &[HourlyStats],
+    low_threshold: u16,
+    high_threshold: u16,
+) -> Vec<Op> {
+    let mut ops = Vec::new();
+    let mut y = PAGE_HEIGHT_MM - MARGIN_MM;
+
+    // Title
+    ops.extend(text_ops("Glucose by Hour of Day", 16.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, COLOR_BLACK));
+    y -= 8.0;
+    
+    let total_readings: usize = hourly_stats.iter().map(|h| h.count).sum();
+    ops.extend(text_ops(&format!("n = {} readings across 24 hours", total_readings), 10.0, MARGIN_MM, y, BuiltinFont::Helvetica, COLOR_GRAY));
+    y -= 15.0;
+
+    if hourly_stats.is_empty() {
+        ops.extend(text_ops("No hourly data available", 12.0, MARGIN_MM, y, BuiltinFont::Helvetica, COLOR_GRAY));
+        return ops;
+    }
+
+    // Chart area for boxplot
+    let chart_x = MARGIN_MM + 15.0;
+    let chart_y = y - 90.0;
+    let chart_width = PAGE_WIDTH_MM - 2.0 * MARGIN_MM - 20.0;
+    let chart_height = 70.0;
+
+    // Draw chart background
+    ops.extend(rect_fill_ops(chart_x, chart_y, chart_width, chart_height, COLOR_LIGHT_GRAY));
+    ops.extend(rect_stroke_ops(chart_x, chart_y, chart_width, chart_height, COLOR_BLACK, 0.5));
+
+    // Y-axis scale
+    let y_min = 40.0_f32;
+    let y_max = 300.0_f32;
+    let y_range = y_max - y_min;
+
+    // Draw threshold lines
+    let low_y_pos = chart_y + ((low_threshold as f32 - y_min) / y_range) * chart_height;
+    let high_y_pos = chart_y + ((high_threshold as f32 - y_min) / y_range) * chart_height;
+    ops.extend(line_ops(chart_x, low_y_pos, chart_x + chart_width, low_y_pos, COLOR_RED, 0.5));
+    ops.extend(line_ops(chart_x, high_y_pos, chart_x + chart_width, high_y_pos, COLOR_ORANGE, 0.5));
+
+    // Y-axis labels
+    for val in [50, 100, 150, 200, 250].iter() {
+        let label_y = chart_y + ((*val as f32 - y_min) / y_range) * chart_height;
+        ops.extend(text_ops(&format!("{}", val), 6.0, MARGIN_MM, label_y - 1.5, BuiltinFont::Helvetica, COLOR_GRAY));
+    }
+
+    // Draw boxplots for each hour
+    let box_width = chart_width / 26.0;
+    for stat in hourly_stats.iter() {
+        if stat.count == 0 {
+            continue;
+        }
+
+        let box_x = chart_x + (stat.hour as f32 + 1.0) * (chart_width / 25.0) - box_width / 2.0;
+        
+        // Calculate y positions
+        let min_y = chart_y + ((stat.min as f32 - y_min) / y_range) * chart_height;
+        let q1_y = chart_y + ((stat.q1 as f32 - y_min) / y_range) * chart_height;
+        let median_y = chart_y + ((stat.median as f32 - y_min) / y_range) * chart_height;
+        let q3_y = chart_y + ((stat.q3 as f32 - y_min) / y_range) * chart_height;
+        let max_y = chart_y + ((stat.max as f32 - y_min) / y_range) * chart_height;
+
+        // Whiskers
+        let whisker_x = box_x + box_width / 2.0;
+        ops.extend(line_ops(whisker_x, min_y, whisker_x, q1_y, COLOR_BLACK, 0.3));
+        ops.extend(line_ops(whisker_x, q3_y, whisker_x, max_y, COLOR_BLACK, 0.3));
+
+        // Box
+        let box_height = q3_y - q1_y;
+        let box_color = if stat.mean < low_threshold as f64 {
+            COLOR_RED
+        } else if stat.mean > high_threshold as f64 {
+            COLOR_ORANGE
+        } else {
+            COLOR_GREEN
+        };
+        ops.extend(rect_fill_ops(box_x, q1_y, box_width, box_height.max(1.0), box_color));
+        ops.extend(rect_stroke_ops(box_x, q1_y, box_width, box_height.max(1.0), COLOR_BLACK, 0.3));
+
+        // Median line
+        ops.extend(line_ops(box_x, median_y, box_x + box_width, median_y, COLOR_BLACK, 0.8));
+    }
+
+    // X-axis labels (every 3 hours)
+    y = chart_y - 5.0;
+    for hour in (0..24).step_by(3) {
+        let label_x = chart_x + (hour as f32 + 1.0) * (chart_width / 25.0) - 3.0;
+        ops.extend(text_ops(&format!("{:02}:00", hour), 6.0, label_x, y, BuiltinFont::Helvetica, COLOR_BLACK));
+    }
+
+    y -= 20.0;
+
+    // Statistics table
+    ops.extend(text_ops("Hourly Statistics Summary", 12.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, COLOR_BLACK));
+    y -= 10.0;
+
+    // Header
+    let col_x = [MARGIN_MM, MARGIN_MM + 20.0, MARGIN_MM + 40.0, MARGIN_MM + 70.0, MARGIN_MM + 100.0, MARGIN_MM + 130.0];
+    ops.extend(text_ops("Hour", 8.0, col_x[0], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
+    ops.extend(text_ops("n", 8.0, col_x[1], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
+    ops.extend(text_ops("Mean+/-SD", 8.0, col_x[2], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
+    ops.extend(text_ops("Median", 8.0, col_x[3], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
+    ops.extend(text_ops("IQR", 8.0, col_x[4], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
+    ops.extend(text_ops("Range", 8.0, col_x[5], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
+    y -= 5.0;
+    ops.extend(line_ops(MARGIN_MM, y, PAGE_WIDTH_MM - MARGIN_MM, y, COLOR_GRAY, 0.3));
+    y -= 5.0;
+
+    // Data rows (show hours with data)
+    for stat in hourly_stats.iter() {
+        if stat.count > 0 && y > MARGIN_MM + 15.0 {
+            ops.extend(text_ops(&format!("{:02}:00", stat.hour), 7.0, col_x[0], y, BuiltinFont::Helvetica, COLOR_BLACK));
+            ops.extend(text_ops(&format!("{}", stat.count), 7.0, col_x[1], y, BuiltinFont::Helvetica, COLOR_BLACK));
+            ops.extend(text_ops(&format!("{:.0}+/-{:.0}", stat.mean, stat.std_dev), 7.0, col_x[2], y, BuiltinFont::Helvetica, COLOR_BLACK));
+            ops.extend(text_ops(&format!("{}", stat.median), 7.0, col_x[3], y, BuiltinFont::Helvetica, COLOR_BLACK));
+            ops.extend(text_ops(&format!("{}-{}", stat.q1, stat.q3), 7.0, col_x[4], y, BuiltinFont::Helvetica, COLOR_BLACK));
+            ops.extend(text_ops(&format!("{}-{}", stat.min, stat.max), 7.0, col_x[5], y, BuiltinFont::Helvetica, COLOR_BLACK));
+            y -= 5.0;
+        }
+    }
+
+    // Footer
+    ops.extend(text_ops("Page 3 - Time of Day Analysis", 8.0, MARGIN_MM, MARGIN_MM, BuiltinFont::Helvetica, COLOR_GRAY));
+
+    ops
+}
+
+fn build_time_bins_page(
+    time_bin_stats: &[TimeBinStats],
+    low_threshold: u16,
+    high_threshold: u16,
+) -> Vec<Op> {
+    let mut ops = Vec::new();
+    let mut y = PAGE_HEIGHT_MM - MARGIN_MM;
+
+    // Title
+    ops.extend(text_ops("Glucose by Clinical Time Periods", 16.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, COLOR_BLACK));
+    y -= 8.0;
+    ops.extend(text_ops("Boxplot analysis of clinically meaningful time windows", 10.0, MARGIN_MM, y, BuiltinFont::Helvetica, COLOR_GRAY));
+    y -= 15.0;
+
+    if time_bin_stats.is_empty() {
+        ops.extend(text_ops("No time bin data available", 12.0, MARGIN_MM, y, BuiltinFont::Helvetica, COLOR_GRAY));
+        return ops;
+    }
+
+    // Chart area
+    let chart_x = MARGIN_MM + 15.0;
+    let chart_y = y - 90.0;
+    let chart_width = PAGE_WIDTH_MM - 2.0 * MARGIN_MM - 20.0;
+    let chart_height = 70.0;
+
+    ops.extend(rect_fill_ops(chart_x, chart_y, chart_width, chart_height, COLOR_LIGHT_GRAY));
+    ops.extend(rect_stroke_ops(chart_x, chart_y, chart_width, chart_height, COLOR_BLACK, 0.5));
+
+    let y_min = 40.0_f32;
+    let y_max = 300.0_f32;
+    let y_range = y_max - y_min;
+
+    // Threshold lines
+    let low_y_pos = chart_y + ((low_threshold as f32 - y_min) / y_range) * chart_height;
+    let high_y_pos = chart_y + ((high_threshold as f32 - y_min) / y_range) * chart_height;
+    ops.extend(line_ops(chart_x, low_y_pos, chart_x + chart_width, low_y_pos, COLOR_RED, 0.5));
+    ops.extend(line_ops(chart_x, high_y_pos, chart_x + chart_width, high_y_pos, COLOR_ORANGE, 0.5));
+
+    // Y-axis labels
+    for val in [50, 100, 150, 200, 250].iter() {
+        let label_y = chart_y + ((*val as f32 - y_min) / y_range) * chart_height;
+        ops.extend(text_ops(&format!("{}", val), 6.0, MARGIN_MM, label_y - 1.5, BuiltinFont::Helvetica, COLOR_GRAY));
+    }
+
+    // Draw boxplots
+    let num_bins = time_bin_stats.len();
+    let box_width = chart_width / (num_bins + 2) as f32;
+
+    for (i, stat) in time_bin_stats.iter().enumerate() {
+        if stat.count == 0 {
+            continue;
+        }
+
+        let box_x = chart_x + (i as f32 + 1.0) * box_width;
+        
+        let min_y = chart_y + ((stat.min as f32 - y_min) / y_range) * chart_height;
+        let q1_y = chart_y + ((stat.q1 as f32 - y_min) / y_range) * chart_height;
+        let median_y = chart_y + ((stat.median as f32 - y_min) / y_range) * chart_height;
+        let q3_y = chart_y + ((stat.q3 as f32 - y_min) / y_range) * chart_height;
+        let max_y = chart_y + ((stat.max as f32 - y_min) / y_range) * chart_height;
+
+        // Whiskers
+        let whisker_x = box_x + box_width / 2.0;
+        ops.extend(line_ops(whisker_x, min_y, whisker_x, q1_y, COLOR_BLACK, 0.3));
+        ops.extend(line_ops(whisker_x, q3_y, whisker_x, max_y, COLOR_BLACK, 0.3));
+
+        // Box
+        let box_height = q3_y - q1_y;
+        let box_color = if stat.mean < low_threshold as f64 {
+            COLOR_RED
+        } else if stat.mean > high_threshold as f64 {
+            COLOR_ORANGE
+        } else {
+            COLOR_GREEN
+        };
+        ops.extend(rect_fill_ops(box_x, q1_y, box_width * 0.8, box_height.max(1.0), box_color));
+        ops.extend(rect_stroke_ops(box_x, q1_y, box_width * 0.8, box_height.max(1.0), COLOR_BLACK, 0.3));
+
+        // Median line
+        ops.extend(line_ops(box_x, median_y, box_x + box_width * 0.8, median_y, COLOR_BLACK, 0.8));
+    }
+
+    // X-axis labels
+    y = chart_y - 5.0;
+    for (i, stat) in time_bin_stats.iter().enumerate() {
+        let label_x = chart_x + (i as f32 + 1.0) * box_width;
+        ops.extend(text_ops(&stat.name, 6.0, label_x, y, BuiltinFont::Helvetica, COLOR_BLACK));
+    }
+
+    y -= 20.0;
+
+    // Statistics table
+    ops.extend(text_ops("Time Period Statistics (with 95% CI)", 12.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, COLOR_BLACK));
+    y -= 10.0;
+
+    // Header
+    let col_x = [MARGIN_MM, MARGIN_MM + 30.0, MARGIN_MM + 50.0, MARGIN_MM + 65.0, MARGIN_MM + 95.0, MARGIN_MM + 120.0, MARGIN_MM + 145.0];
+    ops.extend(text_ops("Period", 8.0, col_x[0], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
+    ops.extend(text_ops("Hours", 8.0, col_x[1], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
+    ops.extend(text_ops("n", 8.0, col_x[2], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
+    ops.extend(text_ops("Mean+/-SD", 8.0, col_x[3], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
+    ops.extend(text_ops("Median", 8.0, col_x[4], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
+    ops.extend(text_ops("IQR", 8.0, col_x[5], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
+    ops.extend(text_ops("95% CI", 8.0, col_x[6], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
+    y -= 5.0;
+    ops.extend(line_ops(MARGIN_MM, y, PAGE_WIDTH_MM - MARGIN_MM, y, COLOR_GRAY, 0.3));
+    y -= 6.0;
+
+    for stat in time_bin_stats {
+        let value_color = get_reading_color(stat.mean as u16, low_threshold, high_threshold);
+        ops.extend(text_ops(&stat.name, 7.0, col_x[0], y, BuiltinFont::Helvetica, COLOR_BLACK));
+        ops.extend(text_ops(&stat.description, 7.0, col_x[1], y, BuiltinFont::Helvetica, COLOR_GRAY));
+        ops.extend(text_ops(&format!("{}", stat.count), 7.0, col_x[2], y, BuiltinFont::Helvetica, COLOR_BLACK));
+        
+        if stat.count > 0 {
+            ops.extend(text_ops(&format!("{:.0}+/-{:.0}", stat.mean, stat.std_dev), 7.0, col_x[3], y, BuiltinFont::Helvetica, value_color));
+            ops.extend(text_ops(&format!("{}", stat.median), 7.0, col_x[4], y, BuiltinFont::Helvetica, COLOR_BLACK));
+            ops.extend(text_ops(&format!("{}-{}", stat.q1, stat.q3), 7.0, col_x[5], y, BuiltinFont::Helvetica, COLOR_BLACK));
+            
+            if stat.count > 1 {
+                let se = stat.std_dev / (stat.count as f64).sqrt();
+                let ci_low = stat.mean - 1.96 * se;
+                let ci_high = stat.mean + 1.96 * se;
+                ops.extend(text_ops(&format!("{:.0}-{:.0}", ci_low, ci_high), 7.0, col_x[6], y, BuiltinFont::Helvetica, COLOR_BLACK));
+            } else {
+                ops.extend(text_ops("-", 7.0, col_x[6], y, BuiltinFont::Helvetica, COLOR_GRAY));
+            }
+        } else {
+            ops.extend(text_ops("-", 7.0, col_x[3], y, BuiltinFont::Helvetica, COLOR_GRAY));
+            ops.extend(text_ops("-", 7.0, col_x[4], y, BuiltinFont::Helvetica, COLOR_GRAY));
+            ops.extend(text_ops("-", 7.0, col_x[5], y, BuiltinFont::Helvetica, COLOR_GRAY));
+            ops.extend(text_ops("-", 7.0, col_x[6], y, BuiltinFont::Helvetica, COLOR_GRAY));
+        }
+        y -= 7.0;
+    }
+
+    // Footer
+    ops.extend(text_ops("Page 4 - Clinical Time Periods", 8.0, MARGIN_MM, MARGIN_MM, BuiltinFont::Helvetica, COLOR_GRAY));
+
+    ops
+}
+
+fn build_daily_tir_page(
+    daily_tir: &[DailyTIR],
+    low_threshold: u16,
+    high_threshold: u16,
+) -> Vec<Op> {
+    let mut ops = Vec::new();
+    let mut y = PAGE_HEIGHT_MM - MARGIN_MM;
+
+    // Title
+    ops.extend(text_ops("Daily Time-in-Range Trend", 16.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, COLOR_BLACK));
+    y -= 8.0;
+    ops.extend(text_ops(&format!("Target range: {}-{} mg/dL | n = {} days", low_threshold, high_threshold, daily_tir.len()), 10.0, MARGIN_MM, y, BuiltinFont::Helvetica, COLOR_GRAY));
+    y -= 15.0;
+
+    if daily_tir.is_empty() {
+        ops.extend(text_ops("No daily TIR data available", 12.0, MARGIN_MM, y, BuiltinFont::Helvetica, COLOR_GRAY));
+        return ops;
+    }
+
+    // TIR trend chart
+    let chart_x = MARGIN_MM + 15.0;
+    let chart_y = y - 70.0;
+    let chart_width = PAGE_WIDTH_MM - 2.0 * MARGIN_MM - 20.0;
+    let chart_height = 50.0;
+
+    ops.extend(rect_fill_ops(chart_x, chart_y, chart_width, chart_height, COLOR_LIGHT_GRAY));
+    ops.extend(rect_stroke_ops(chart_x, chart_y, chart_width, chart_height, COLOR_BLACK, 0.5));
+
+    // 70% goal line
+    let goal_y = chart_y + 0.7 * chart_height;
+    ops.extend(line_ops(chart_x, goal_y, chart_x + chart_width, goal_y, COLOR_GRAY, 0.5));
+    ops.extend(text_ops("70%", 6.0, MARGIN_MM, goal_y - 1.5, BuiltinFont::Helvetica, COLOR_GRAY));
+
+    // Y-axis labels
+    ops.extend(text_ops("0%", 6.0, MARGIN_MM, chart_y - 1.5, BuiltinFont::Helvetica, COLOR_GRAY));
+    ops.extend(text_ops("100%", 6.0, MARGIN_MM, chart_y + chart_height - 1.5, BuiltinFont::Helvetica, COLOR_GRAY));
+
+    // Draw TIR line
+    let n = daily_tir.len();
+    if n > 1 {
+        let x_step = chart_width / (n - 1) as f32;
+        for i in 0..n - 1 {
+            let x1 = chart_x + i as f32 * x_step;
+            let x2 = chart_x + (i + 1) as f32 * x_step;
+            let y1 = chart_y + (daily_tir[i].in_range_pct as f32 / 100.0) * chart_height;
+            let y2 = chart_y + (daily_tir[i + 1].in_range_pct as f32 / 100.0) * chart_height;
+            ops.extend(line_ops(x1, y1, x2, y2, COLOR_GREEN, 1.0));
+        }
+        
+        // Draw points
+        for i in 0..n {
+            let x = chart_x + i as f32 * x_step;
+            let y_pos = chart_y + (daily_tir[i].in_range_pct as f32 / 100.0) * chart_height;
+            let color = if daily_tir[i].in_range_pct >= 70.0 { COLOR_GREEN } else { COLOR_ORANGE };
+            ops.extend(point_ops(x, y_pos, 1.5, color));
+        }
+    }
+
+    y = chart_y - 10.0;
+
+    // Summary stats
+    let avg_tir: f64 = daily_tir.iter().map(|d| d.in_range_pct).sum::<f64>() / daily_tir.len() as f64;
+    let days_at_goal = daily_tir.iter().filter(|d| d.in_range_pct >= 70.0).count();
+    
+    ops.extend(text_ops(&format!("Average TIR: {:.1}%", avg_tir), 10.0, MARGIN_MM, y, BuiltinFont::Helvetica, COLOR_BLACK));
+    ops.extend(text_ops(&format!("Days at >=70% goal: {}/{} ({:.1}%)", days_at_goal, daily_tir.len(), (days_at_goal as f64 / daily_tir.len() as f64) * 100.0), 10.0, MARGIN_MM + 60.0, y, BuiltinFont::Helvetica, COLOR_BLACK));
+
+    y -= 15.0;
+
+    // Daily details table
+    ops.extend(text_ops("Daily Time-in-Range Details", 12.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, COLOR_BLACK));
+    y -= 10.0;
+
+    let col_x = [MARGIN_MM, MARGIN_MM + 30.0, MARGIN_MM + 50.0, MARGIN_MM + 80.0, MARGIN_MM + 110.0, MARGIN_MM + 140.0];
+    ops.extend(text_ops("Date", 8.0, col_x[0], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
+    ops.extend(text_ops("Count", 8.0, col_x[1], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
+    ops.extend(text_ops("Low %", 8.0, col_x[2], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
+    ops.extend(text_ops("In Range %", 8.0, col_x[3], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
+    ops.extend(text_ops("High %", 8.0, col_x[4], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
+    ops.extend(text_ops("Goal", 8.0, col_x[5], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
+    y -= 5.0;
+    ops.extend(line_ops(MARGIN_MM, y, PAGE_WIDTH_MM - MARGIN_MM, y, COLOR_GRAY, 0.3));
+    y -= 5.0;
+
+    for day in daily_tir.iter().rev().take(25) {  // Show most recent 25 days
+        if y < MARGIN_MM + 15.0 {
+            break;
+        }
+        
+        ops.extend(text_ops(&day.date, 7.0, col_x[0], y, BuiltinFont::Helvetica, COLOR_BLACK));
+        ops.extend(text_ops(&format!("{}", day.total), 7.0, col_x[1], y, BuiltinFont::Helvetica, COLOR_BLACK));
+        ops.extend(text_ops(&format!("{:.1}%", day.low_pct), 7.0, col_x[2], y, BuiltinFont::Helvetica, COLOR_RED));
+        ops.extend(text_ops(&format!("{:.1}%", day.in_range_pct), 7.0, col_x[3], y, BuiltinFont::Helvetica, COLOR_GREEN));
+        ops.extend(text_ops(&format!("{:.1}%", day.high_pct), 7.0, col_x[4], y, BuiltinFont::Helvetica, COLOR_ORANGE));
+        
+        let goal_text = if day.in_range_pct >= 70.0 { "Yes" } else { "-" };
+        let goal_color = if day.in_range_pct >= 70.0 { COLOR_GREEN } else { COLOR_GRAY };
+        ops.extend(text_ops(goal_text, 7.0, col_x[5], y, BuiltinFont::Helvetica, goal_color));
+        
+        y -= 5.0;
+    }
+
+    // Footer
+    ops.extend(text_ops("Page 5 - Daily TIR Trend", 8.0, MARGIN_MM, MARGIN_MM, BuiltinFont::Helvetica, COLOR_GRAY));
 
     ops
 }

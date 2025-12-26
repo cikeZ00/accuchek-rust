@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::device::find_and_operate_accuchek;
-use crate::storage::{Storage, StoredReading, TimeInRange, DailyStats};
+use crate::storage::{Storage, StoredReading, TimeInRange, DailyStats, HourlyStats, TimeBinStats, DailyTIR, CalendarDay, HistogramBin};
 use crate::export::export_to_pdf;
 
 /// Persistent user settings
@@ -71,12 +71,20 @@ pub struct AccuChekApp {
     time_in_range: Option<TimeInRange>,
     daily_stats: Vec<DailyStats>,
     
+    // Visualization data
+    hourly_stats: Vec<HourlyStats>,
+    time_bin_stats: Vec<TimeBinStats>,
+    daily_tir: Vec<DailyTIR>,
+    calendar_data: Vec<CalendarDay>,
+    histogram_bins: Vec<HistogramBin>,
+    
     // UI state
     current_tab: Tab,
     selected_reading: Option<usize>,
     note_edit_buffer: String,
     tag_edit_buffer: String,
     search_query: String,
+    current_chart_view: ChartView,
     
     // Sync state
     sync_receiver: Option<Receiver<SyncMessage>>,
@@ -103,6 +111,16 @@ enum Tab {
 }
 
 #[derive(PartialEq, Clone, Copy)]
+enum ChartView {
+    Overview,
+    Histogram,
+    TimeOfDay,
+    DailyTrend,
+    TimeBins,
+    Calendar,
+}
+
+#[derive(PartialEq, Clone, Copy)]
 enum SyncStatus {
     Idle,
     Syncing,
@@ -125,11 +143,17 @@ impl Default for AccuChekApp {
             readings: Vec::new(),
             time_in_range: None,
             daily_stats: Vec::new(),
+            hourly_stats: Vec::new(),
+            time_bin_stats: Vec::new(),
+            daily_tir: Vec::new(),
+            calendar_data: Vec::new(),
+            histogram_bins: Vec::new(),
             current_tab: Tab::Dashboard,
             selected_reading: None,
             note_edit_buffer: String::new(),
             tag_edit_buffer: String::new(),
             search_query: String::new(),
+            current_chart_view: ChartView::Overview,
             sync_receiver: None,
             sync_status: SyncStatus::Idle,
             last_sync_message: String::new(),
@@ -170,6 +194,13 @@ impl AccuChekApp {
             self.readings = storage.get_all_readings().unwrap_or_default();
             self.time_in_range = storage.get_time_in_range().ok();
             self.daily_stats = storage.get_daily_averages().unwrap_or_default();
+            
+            // Load visualization data
+            self.hourly_stats = storage.get_hourly_stats().unwrap_or_default();
+            self.time_bin_stats = storage.get_time_bin_stats(self.low_threshold, self.high_threshold).unwrap_or_default();
+            self.daily_tir = storage.get_daily_tir(self.low_threshold, self.high_threshold).unwrap_or_default();
+            self.calendar_data = storage.get_calendar_data(self.low_threshold, self.high_threshold).unwrap_or_default();
+            self.histogram_bins = storage.get_histogram(20, self.low_threshold, self.high_threshold).unwrap_or_default();
         }
     }
     
@@ -296,6 +327,10 @@ impl AccuChekApp {
                 &self.daily_stats,
                 self.low_threshold,
                 self.high_threshold,
+                &self.hourly_stats,
+                &self.time_bin_stats,
+                &self.daily_tir,
+                &self.histogram_bins,
             ) {
                 Ok(()) => {
                     self.export_status = ExportStatus::Success;
@@ -897,7 +932,19 @@ impl AccuChekApp {
     }
     
     fn show_charts(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Charts");
+        ui.horizontal(|ui| {
+            ui.heading("Charts & Visualizations");
+            ui.add_space(20.0);
+            
+            // Chart view selector
+            ui.label("View:");
+            ui.selectable_value(&mut self.current_chart_view, ChartView::Overview, "Overview");
+            ui.selectable_value(&mut self.current_chart_view, ChartView::Histogram, "Distribution");
+            ui.selectable_value(&mut self.current_chart_view, ChartView::TimeOfDay, "Time of Day");
+            ui.selectable_value(&mut self.current_chart_view, ChartView::DailyTrend, "Daily TIR Trend");
+            ui.selectable_value(&mut self.current_chart_view, ChartView::TimeBins, "Time Bins");
+            ui.selectable_value(&mut self.current_chart_view, ChartView::Calendar, "Calendar");
+        });
         ui.separator();
         
         if self.readings.is_empty() {
@@ -905,9 +952,23 @@ impl AccuChekApp {
             return;
         }
         
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            match self.current_chart_view {
+                ChartView::Overview => self.show_overview_charts(ui),
+                ChartView::Histogram => self.show_histogram_chart(ui),
+                ChartView::TimeOfDay => self.show_time_of_day_chart(ui),
+                ChartView::DailyTrend => self.show_daily_tir_trend(ui),
+                ChartView::TimeBins => self.show_time_bins_boxplot(ui),
+                ChartView::Calendar => self.show_calendar_view(ui),
+            }
+        });
+    }
+    
+    fn show_overview_charts(&mut self, ui: &mut egui::Ui) {
         // Glucose trend chart
         ui.group(|ui| {
             ui.label(egui::RichText::new("Glucose Trend (All Readings)").heading());
+            ui.label(format!("n = {} readings", self.readings.len()));
             
             let points: PlotPoints = self.readings.iter().enumerate()
                 .map(|(i, r)| [i as f64, r.mg_dl as f64])
@@ -945,7 +1006,8 @@ impl AccuChekApp {
         // Daily averages chart
         if !self.daily_stats.is_empty() {
             ui.group(|ui| {
-                ui.label(egui::RichText::new("Daily Averages").heading());
+                ui.label(egui::RichText::new("Daily Averages with Range").heading());
+                ui.label(format!("n = {} days", self.daily_stats.len()));
                 
                 let avg_points: PlotPoints = self.daily_stats.iter().enumerate()
                     .map(|(i, d)| [i as f64, d.avg_mg_dl])
@@ -987,7 +1049,7 @@ impl AccuChekApp {
                         if i > 0 {
                             ui.label(" | ");
                         }
-                        ui.label(format!("{}: {}", i, &stat.date));
+                        ui.label(format!("{}: {} (n={})", i, &stat.date, stat.count));
                     }
                 });
             });
@@ -995,7 +1057,7 @@ impl AccuChekApp {
         
         ui.add_space(20.0);
         
-        // Distribution histogram-like display
+        // Quick distribution view
         ui.group(|ui| {
             ui.label(egui::RichText::new("Reading Distribution").heading());
             
@@ -1025,6 +1087,489 @@ impl AccuChekApp {
                     ui.add(bar);
                 });
             }
+        });
+    }
+    
+    fn show_histogram_chart(&mut self, ui: &mut egui::Ui) {
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("Glucose Distribution Histogram").heading());
+            ui.label(format!("n = {} readings, bin width = 20 mg/dL", self.readings.len()));
+            
+            if self.histogram_bins.is_empty() {
+                ui.label("No histogram data available.");
+                return;
+            }
+            
+            // Calculate max count for scaling (used for reference)
+            let _max_count = self.histogram_bins.iter().map(|b| b.count).max().unwrap_or(1);
+            
+            // Draw histogram bars using egui_plot
+            use egui_plot::{Bar, BarChart};
+            
+            let bars: Vec<Bar> = self.histogram_bins.iter()
+                .map(|bin| {
+                    let mid = (bin.range_start + bin.range_end) as f64 / 2.0;
+                    let color = if bin.range_end <= self.low_threshold {
+                        egui::Color32::from_rgb(255, 100, 100)
+                    } else if bin.range_start >= self.high_threshold {
+                        egui::Color32::from_rgb(255, 180, 100)
+                    } else {
+                        egui::Color32::from_rgb(100, 200, 100)
+                    };
+                    Bar::new(mid, bin.count as f64)
+                        .width(18.0)
+                        .fill(color)
+                        .name(format!("{}-{}", bin.range_start, bin.range_end))
+                })
+                .collect();
+            
+            let chart = BarChart::new("histogram", bars);
+            
+            Plot::new("glucose_histogram")
+                .height(300.0)
+                .x_axis_label("Glucose (mg/dL)")
+                .y_axis_label("Count")
+                .show(ui, |plot_ui| {
+                    plot_ui.bar_chart(chart);
+                });
+            
+            ui.add_space(10.0);
+            
+            // Statistics summary
+            if !self.readings.is_empty() {
+                let values: Vec<f64> = self.readings.iter().map(|r| r.mg_dl as f64).collect();
+                let mean = values.iter().sum::<f64>() / values.len() as f64;
+                let mut sorted = values.clone();
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let median = sorted[sorted.len() / 2];
+                let variance: f64 = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (values.len() - 1) as f64;
+                let std_dev = variance.sqrt();
+                
+                // 95% CI for mean
+                let se = std_dev / (values.len() as f64).sqrt();
+                let ci_low = mean - 1.96 * se;
+                let ci_high = mean + 1.96 * se;
+                
+                ui.horizontal(|ui| {
+                    ui.label(format!("Mean: {:.1} mg/dL (95% CI: {:.1}-{:.1})", mean, ci_low, ci_high));
+                    ui.separator();
+                    ui.label(format!("Median: {:.1} mg/dL", median));
+                    ui.separator();
+                    ui.label(format!("SD: {:.1}", std_dev));
+                });
+            }
+        });
+    }
+    
+    fn show_time_of_day_chart(&mut self, ui: &mut egui::Ui) {
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("Glucose by Hour of Day (Scatter + Boxplot)").heading());
+            
+            let total_readings: usize = self.hourly_stats.iter().map(|h| h.count).sum();
+            ui.label(format!("n = {} readings across 24 hours", total_readings));
+            
+            if self.hourly_stats.is_empty() {
+                ui.label("No hourly data available.");
+                return;
+            }
+            
+            // Create scatter plot with all points + boxplot overlay
+            use egui_plot::{Points, BoxElem, BoxPlot, BoxSpread};
+            
+            // Collect all points for scatter
+            let mut all_points: Vec<[f64; 2]> = Vec::new();
+            for stat in &self.hourly_stats {
+                for &val in &stat.readings {
+                    // Add small jitter for visibility
+                    let jitter = (val as f64 % 7.0 - 3.5) * 0.1;
+                    all_points.push([stat.hour as f64 + jitter, val as f64]);
+                }
+            }
+            
+            let scatter = Points::new("Readings", PlotPoints::from_iter(all_points))
+                .radius(2.0)
+                .color(egui::Color32::from_rgba_unmultiplied(100, 150, 255, 100));
+            
+            // Create boxplot elements
+            let boxes: Vec<BoxElem> = self.hourly_stats.iter()
+                .filter(|s| s.count > 0)
+                .map(|stat| {
+                    BoxElem::new(stat.hour as f64, BoxSpread::new(
+                        stat.min as f64,
+                        stat.q1 as f64,
+                        stat.median as f64,
+                        stat.q3 as f64,
+                        stat.max as f64,
+                    ))
+                    .whisker_width(0.3)
+                    .box_width(0.6)
+                    .fill(egui::Color32::from_rgba_unmultiplied(100, 200, 100, 150))
+                    .stroke(egui::Stroke::new(1.5, egui::Color32::from_rgb(50, 150, 50)))
+                })
+                .collect();
+            
+            let boxplot = BoxPlot::new("Hourly Distribution", boxes);
+            
+            // Threshold lines
+            let low_line = Line::new(format!("Low ({})", self.low_threshold), PlotPoints::from_iter(
+                (0..25).map(|h| [h as f64, self.low_threshold as f64])
+            ))
+            .color(egui::Color32::from_rgb(255, 100, 100))
+            .style(egui_plot::LineStyle::dashed_dense());
+            
+            let high_line = Line::new(format!("High ({})", self.high_threshold), PlotPoints::from_iter(
+                (0..25).map(|h| [h as f64, self.high_threshold as f64])
+            ))
+            .color(egui::Color32::from_rgb(255, 180, 100))
+            .style(egui_plot::LineStyle::dashed_dense());
+            
+            Plot::new("time_of_day_scatter")
+                .height(350.0)
+                .x_axis_label("Hour of Day")
+                .y_axis_label("Glucose (mg/dL)")
+                .legend(egui_plot::Legend::default())
+                .show(ui, |plot_ui| {
+                    plot_ui.points(scatter);
+                    plot_ui.box_plot(boxplot);
+                    plot_ui.line(low_line);
+                    plot_ui.line(high_line);
+                });
+            
+            ui.add_space(10.0);
+            
+            // Hourly summary table
+            ui.collapsing("Hourly Statistics", |ui| {
+                egui::Grid::new("hourly_stats_grid")
+                    .num_columns(6)
+                    .spacing([15.0, 4.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("Hour").strong());
+                        ui.label(egui::RichText::new("Count").strong());
+                        ui.label(egui::RichText::new("Mean±SD").strong());
+                        ui.label(egui::RichText::new("Median").strong());
+                        ui.label(egui::RichText::new("IQR").strong());
+                        ui.label(egui::RichText::new("Range").strong());
+                        ui.end_row();
+                        
+                        for stat in &self.hourly_stats {
+                            if stat.count > 0 {
+                                ui.label(format!("{:02}:00", stat.hour));
+                                ui.label(format!("{}", stat.count));
+                                ui.label(format!("{:.0}±{:.0}", stat.mean, stat.std_dev));
+                                ui.label(format!("{}", stat.median));
+                                ui.label(format!("{}-{}", stat.q1, stat.q3));
+                                ui.label(format!("{}-{}", stat.min, stat.max));
+                                ui.end_row();
+                            }
+                        }
+                    });
+            });
+        });
+    }
+    
+    fn show_daily_tir_trend(&mut self, ui: &mut egui::Ui) {
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("Daily Time-in-Range Trend").heading());
+            ui.label(format!("Target range: {}-{} mg/dL | n = {} days", 
+                self.low_threshold, self.high_threshold, self.daily_tir.len()));
+            
+            if self.daily_tir.is_empty() {
+                ui.label("No daily TIR data available.");
+                return;
+            }
+            
+            // Note: Stacked area chart lines are prepared but we use the simpler TIR trend line
+            // The percentages are available if needed for a more complex visualization
+            
+            // In-range percentage trend line
+            let tir_trend = Line::new("TIR %", PlotPoints::from_iter(
+                self.daily_tir.iter().enumerate().map(|(i, d)| [i as f64, d.in_range_pct])
+            ))
+            .color(egui::Color32::from_rgb(50, 200, 50))
+            .width(2.0);
+            
+            Plot::new("daily_tir_trend")
+                .height(250.0)
+                .x_axis_label("Day")
+                .y_axis_label("Percentage")
+                .legend(egui_plot::Legend::default())
+                .show(ui, |plot_ui| {
+                    plot_ui.line(tir_trend);
+                    // Reference line at 70% TIR goal
+                    let goal_line = Line::new("70% Goal", PlotPoints::from_iter(
+                        (0..self.daily_tir.len() + 1).map(|i| [i as f64, 70.0])
+                    ))
+                    .color(egui::Color32::from_rgb(150, 150, 150))
+                    .style(egui_plot::LineStyle::dashed_loose());
+                    plot_ui.line(goal_line);
+                });
+            
+            ui.add_space(10.0);
+            
+            // Summary stats
+            if !self.daily_tir.is_empty() {
+                let avg_tir: f64 = self.daily_tir.iter().map(|d| d.in_range_pct).sum::<f64>() 
+                    / self.daily_tir.len() as f64;
+                let days_at_goal = self.daily_tir.iter().filter(|d| d.in_range_pct >= 70.0).count();
+                
+                ui.horizontal(|ui| {
+                    ui.label(format!("Average TIR: {:.1}%", avg_tir));
+                    ui.separator();
+                    ui.label(format!("Days at ≥70% goal: {}/{} ({:.1}%)", 
+                        days_at_goal, self.daily_tir.len(), 
+                        (days_at_goal as f64 / self.daily_tir.len() as f64) * 100.0));
+                });
+            }
+            
+            ui.add_space(10.0);
+            
+            // Daily breakdown table
+            ui.collapsing("Daily Details", |ui| {
+                egui::Grid::new("daily_tir_grid")
+                    .num_columns(6)
+                    .spacing([15.0, 4.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("Date").strong());
+                        ui.label(egui::RichText::new("Count").strong());
+                        ui.label(egui::RichText::new("Low %").strong());
+                        ui.label(egui::RichText::new("In Range %").strong());
+                        ui.label(egui::RichText::new("High %").strong());
+                        ui.label(egui::RichText::new("Status").strong());
+                        ui.end_row();
+                        
+                        for day in &self.daily_tir {
+                            ui.label(&day.date);
+                            ui.label(format!("{}", day.total));
+                            ui.colored_label(
+                                egui::Color32::from_rgb(255, 100, 100),
+                                format!("{:.1}%", day.low_pct)
+                            );
+                            ui.colored_label(
+                                egui::Color32::from_rgb(100, 200, 100),
+                                format!("{:.1}%", day.in_range_pct)
+                            );
+                            ui.colored_label(
+                                egui::Color32::from_rgb(255, 180, 100),
+                                format!("{:.1}%", day.high_pct)
+                            );
+                            let status = if day.in_range_pct >= 70.0 { "✓" } else { "—" };
+                            ui.label(status);
+                            ui.end_row();
+                        }
+                    });
+            });
+        });
+    }
+    
+    fn show_time_bins_boxplot(&mut self, ui: &mut egui::Ui) {
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("Glucose by Clinical Time Periods (Boxplots)").heading());
+            ui.label("Shows glucose patterns across clinically meaningful time windows");
+            
+            if self.time_bin_stats.is_empty() {
+                ui.label("No time bin data available.");
+                return;
+            }
+            
+            use egui_plot::{BoxElem, BoxPlot, BoxSpread};
+            
+            // Create boxplot elements
+            let boxes: Vec<BoxElem> = self.time_bin_stats.iter()
+                .enumerate()
+                .filter(|(_, s)| s.count > 0)
+                .map(|(i, stat)| {
+                    let color = if stat.mean < self.low_threshold as f64 {
+                        egui::Color32::from_rgb(255, 120, 120)
+                    } else if stat.mean > self.high_threshold as f64 {
+                        egui::Color32::from_rgb(255, 200, 120)
+                    } else {
+                        egui::Color32::from_rgb(120, 200, 120)
+                    };
+                    
+                    BoxElem::new(i as f64, BoxSpread::new(
+                        stat.min as f64,
+                        stat.q1 as f64,
+                        stat.median as f64,
+                        stat.q3 as f64,
+                        stat.max as f64,
+                    ))
+                    .whisker_width(0.4)
+                    .box_width(0.7)
+                    .fill(color)
+                    .stroke(egui::Stroke::new(1.5, egui::Color32::from_rgb(80, 80, 80)))
+                    .name(&stat.name)
+                })
+                .collect();
+            
+            let boxplot = BoxPlot::new("Time Bin Analysis", boxes);
+            
+            // Threshold lines
+            let low_line = Line::new(format!("Low ({})", self.low_threshold), PlotPoints::from_iter(
+                (-1..7).map(|x| [x as f64, self.low_threshold as f64])
+            ))
+            .color(egui::Color32::from_rgb(255, 100, 100))
+            .style(egui_plot::LineStyle::dashed_dense());
+            
+            let high_line = Line::new(format!("High ({})", self.high_threshold), PlotPoints::from_iter(
+                (-1..7).map(|x| [x as f64, self.high_threshold as f64])
+            ))
+            .color(egui::Color32::from_rgb(255, 180, 100))
+            .style(egui_plot::LineStyle::dashed_dense());
+            
+            Plot::new("time_bins_boxplot")
+                .height(300.0)
+                .y_axis_label("Glucose (mg/dL)")
+                .legend(egui_plot::Legend::default())
+                .show(ui, |plot_ui| {
+                    plot_ui.box_plot(boxplot);
+                    plot_ui.line(low_line);
+                    plot_ui.line(high_line);
+                });
+            
+            ui.add_space(10.0);
+            
+            // Time bin statistics table
+            egui::Grid::new("time_bin_stats_grid")
+                .num_columns(7)
+                .spacing([12.0, 4.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new("Time Period").strong());
+                    ui.label(egui::RichText::new("Hours").strong());
+                    ui.label(egui::RichText::new("n").strong());
+                    ui.label(egui::RichText::new("Mean±SD").strong());
+                    ui.label(egui::RichText::new("Median").strong());
+                    ui.label(egui::RichText::new("IQR").strong());
+                    ui.label(egui::RichText::new("95% CI").strong());
+                    ui.end_row();
+                    
+                    for stat in &self.time_bin_stats {
+                        ui.label(&stat.name);
+                        ui.label(&stat.description);
+                        ui.label(format!("{}", stat.count));
+                        
+                        if stat.count > 0 {
+                            let color = self.get_reading_color(stat.mean as u16);
+                            ui.colored_label(color, format!("{:.0}±{:.0}", stat.mean, stat.std_dev));
+                            ui.label(format!("{}", stat.median));
+                            ui.label(format!("{}-{}", stat.q1, stat.q3));
+                            
+                            // 95% CI
+                            if stat.count > 1 {
+                                let se = stat.std_dev / (stat.count as f64).sqrt();
+                                let ci_low = stat.mean - 1.96 * se;
+                                let ci_high = stat.mean + 1.96 * se;
+                                ui.label(format!("{:.0}-{:.0}", ci_low, ci_high));
+                            } else {
+                                ui.label("-");
+                            }
+                        } else {
+                            ui.label("-");
+                            ui.label("-");
+                            ui.label("-");
+                            ui.label("-");
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+    }
+    
+    fn show_calendar_view(&mut self, ui: &mut egui::Ui) {
+        ui.group(|ui| {
+            ui.label(egui::RichText::new("Calendar View (Daily Small Multiples)").heading());
+            ui.label(format!("Showing {} days with readings", self.calendar_data.len()));
+            
+            if self.calendar_data.is_empty() {
+                ui.label("No calendar data available.");
+                return;
+            }
+            
+            // Group by week
+            use std::collections::BTreeMap;
+            let mut weeks: BTreeMap<u32, Vec<&CalendarDay>> = BTreeMap::new();
+            for day in &self.calendar_data {
+                weeks.entry(day.week_of_year).or_insert_with(Vec::new).push(day);
+            }
+            
+            let day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+            
+            // Header row
+            ui.horizontal(|ui| {
+                ui.label("Week");
+                for name in day_names {
+                    ui.add_sized([80.0, 20.0], egui::Label::new(name));
+                }
+            });
+            ui.separator();
+            
+            // Calendar grid
+            egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
+                for (week, days) in weeks.iter().rev().take(12) {  // Show last 12 weeks
+                    ui.horizontal(|ui| {
+                        ui.label(format!("W{}", week));
+                        
+                        for dow in 0..7 {
+                            let day_data = days.iter().find(|d| d.day_of_week == dow);
+                            
+                            ui.allocate_ui(egui::Vec2::new(80.0, 60.0), |ui| {
+                                if let Some(day) = day_data {
+                                    // Color based on TIR
+                                    let bg_color = if day.in_range_pct >= 70.0 {
+                                        egui::Color32::from_rgb(200, 255, 200)
+                                    } else if day.in_range_pct >= 50.0 {
+                                        egui::Color32::from_rgb(255, 255, 200)
+                                    } else {
+                                        egui::Color32::from_rgb(255, 220, 200)
+                                    };
+                                    
+                                    egui::Frame::new()
+                                        .fill(bg_color)
+                                        .inner_margin(4.0)
+                                        .corner_radius(4.0)
+                                        .show(ui, |ui| {
+                                            ui.vertical(|ui| {
+                                                ui.label(egui::RichText::new(&day.date[5..]).small());
+                                                ui.label(format!("n={}", day.count));
+                                                ui.label(format!("{:.0}", day.mean));
+                                                ui.label(format!("{}%", day.in_range_pct as i32));
+                                            });
+                                        });
+                                } else {
+                                    egui::Frame::new()
+                                        .fill(egui::Color32::from_gray(40))
+                                        .inner_margin(4.0)
+                                        .corner_radius(4.0)
+                                        .show(ui, |ui| {
+                                            ui.label("-");
+                                        });
+                                }
+                            });
+                        }
+                    });
+                }
+            });
+            
+            ui.add_space(10.0);
+            
+            // Legend
+            ui.horizontal(|ui| {
+                ui.label("Legend:");
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(200, 255, 200))
+                    .inner_margin(4.0)
+                    .show(ui, |ui| { ui.label("≥70% TIR"); });
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(255, 255, 200))
+                    .inner_margin(4.0)
+                    .show(ui, |ui| { ui.label("50-70% TIR"); });
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(255, 220, 200))
+                    .inner_margin(4.0)
+                    .show(ui, |ui| { ui.label("<50% TIR"); });
+            });
         });
     }
 }
