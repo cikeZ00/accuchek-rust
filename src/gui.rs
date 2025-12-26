@@ -4,11 +4,55 @@ use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
+use std::fs;
+use std::io::Write;
+use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::device::find_and_operate_accuchek;
 use crate::storage::{Storage, StoredReading, TimeInRange, DailyStats};
 use crate::export::export_to_pdf;
+
+/// Persistent user settings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppSettings {
+    pub low_threshold: u16,
+    pub high_threshold: u16,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            low_threshold: 70,
+            high_threshold: 180,
+        }
+    }
+}
+
+impl AppSettings {
+    /// Load settings from the settings file
+    pub fn load() -> Self {
+        let path = crate::config::settings_file_path();
+        if path.exists() {
+            if let Ok(contents) = fs::read_to_string(&path) {
+                if let Ok(settings) = serde_json::from_str(&contents) {
+                    return settings;
+                }
+            }
+        }
+        Self::default()
+    }
+    
+    /// Save settings to the settings file
+    pub fn save(&self) {
+        let path = crate::config::settings_file_path();
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            if let Ok(mut file) = fs::File::create(&path) {
+                let _ = file.write_all(json.as_bytes());
+            }
+        }
+    }
+}
 
 /// Message from sync thread to UI
 pub enum SyncMessage {
@@ -47,6 +91,8 @@ pub struct AccuChekApp {
     // Export state
     export_message: String,
     export_status: ExportStatus,
+    exported_path: Option<std::path::PathBuf>,
+    show_export_dialog: bool,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -73,6 +119,7 @@ enum ExportStatus {
 
 impl Default for AccuChekApp {
     fn default() -> Self {
+        let settings = AppSettings::load();
         Self {
             db_path: "accuchek.db".to_string(),
             readings: Vec::new(),
@@ -86,11 +133,13 @@ impl Default for AccuChekApp {
             sync_receiver: None,
             sync_status: SyncStatus::Idle,
             last_sync_message: String::new(),
-            low_threshold: 70,
-            high_threshold: 180,
+            low_threshold: settings.low_threshold,
+            high_threshold: settings.high_threshold,
             show_settings: false,
             export_message: String::new(),
             export_status: ExportStatus::Idle,
+            exported_path: None,
+            show_export_dialog: false,
         }
     }
 }
@@ -102,8 +151,13 @@ impl AccuChekApp {
         visuals.override_text_color = Some(egui::Color32::from_gray(220));
         cc.egui_ctx.set_visuals(visuals);
         
+        // Load settings
+        let settings = AppSettings::load();
+        
         let mut app = Self {
             db_path,
+            low_threshold: settings.low_threshold,
+            high_threshold: settings.high_threshold,
             ..Default::default()
         };
         
@@ -246,10 +300,13 @@ impl AccuChekApp {
                 Ok(()) => {
                     self.export_status = ExportStatus::Success;
                     self.export_message = format!("Exported to {}", path.display());
+                    self.exported_path = Some(path);
+                    self.show_export_dialog = true;
                 }
                 Err(e) => {
                     self.export_status = ExportStatus::Error;
                     self.export_message = format!("Export failed: {}", e);
+                    self.exported_path = None;
                 }
             }
         }
@@ -365,6 +422,8 @@ impl eframe::App for AccuChekApp {
         
         // Settings window
         if self.show_settings {
+            let mut save_settings = false;
+            
             egui::Window::new("Settings")
                 .collapsible(false)
                 .resizable(false)
@@ -374,11 +433,15 @@ impl eframe::App for AccuChekApp {
                     
                     ui.horizontal(|ui| {
                         ui.label("Low threshold (mg/dL):");
-                        ui.add(egui::DragValue::new(&mut self.low_threshold).range(50..=100));
+                        if ui.add(egui::DragValue::new(&mut self.low_threshold).range(50..=100)).changed() {
+                            save_settings = true;
+                        }
                     });
                     ui.horizontal(|ui| {
                         ui.label("High threshold (mg/dL):");
-                        ui.add(egui::DragValue::new(&mut self.high_threshold).range(140..=250));
+                        if ui.add(egui::DragValue::new(&mut self.high_threshold).range(140..=250)).changed() {
+                            save_settings = true;
+                        }
                     });
                     
                     ui.add_space(10.0);
@@ -431,6 +494,84 @@ impl eframe::App for AccuChekApp {
                         }
                     });
                 });
+            
+            // Save settings if changed
+            if save_settings {
+                let settings = AppSettings {
+                    low_threshold: self.low_threshold,
+                    high_threshold: self.high_threshold,
+                };
+                settings.save();
+            }
+        }
+        
+        // Export success dialog
+        if self.show_export_dialog {
+            if let Some(ref path) = self.exported_path {
+                let path_clone = path.clone();
+                egui::Window::new("Export Successful")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                    .show(ctx, |ui| {
+                        ui.label("PDF exported successfully!");
+                        ui.add_space(5.0);
+                        ui.label(format!("{}", path_clone.display()));
+                        ui.add_space(15.0);
+                        
+                        ui.horizontal(|ui| {
+                            if ui.button("Open File").clicked() {
+                                #[cfg(target_os = "windows")]
+                                {
+                                    let _ = std::process::Command::new("cmd")
+                                        .args(["/C", "start", "", &path_clone.to_string_lossy()])
+                                        .spawn();
+                                }
+                                #[cfg(target_os = "linux")]
+                                {
+                                    let _ = std::process::Command::new("xdg-open")
+                                        .arg(&path_clone)
+                                        .spawn();
+                                }
+                                #[cfg(target_os = "macos")]
+                                {
+                                    let _ = std::process::Command::new("open")
+                                        .arg(&path_clone)
+                                        .spawn();
+                                }
+                                self.show_export_dialog = false;
+                            }
+                            
+                            if ui.button("Open Folder").clicked() {
+                                if let Some(parent) = path_clone.parent() {
+                                    #[cfg(target_os = "windows")]
+                                    {
+                                        let _ = std::process::Command::new("explorer")
+                                            .arg(parent)
+                                            .spawn();
+                                    }
+                                    #[cfg(target_os = "linux")]
+                                    {
+                                        let _ = std::process::Command::new("xdg-open")
+                                            .arg(parent)
+                                            .spawn();
+                                    }
+                                    #[cfg(target_os = "macos")]
+                                    {
+                                        let _ = std::process::Command::new("open")
+                                            .arg(parent)
+                                            .spawn();
+                                    }
+                                }
+                                self.show_export_dialog = false;
+                            }
+                            
+                            if ui.button("Close").clicked() {
+                                self.show_export_dialog = false;
+                            }
+                        });
+                    });
+            }
         }
         
         // Main content

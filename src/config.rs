@@ -44,6 +44,11 @@ pub fn config_file_path() -> PathBuf {
     get_data_dir().join("config.txt")
 }
 
+/// Get the settings file path (in data directory)
+pub fn settings_file_path() -> PathBuf {
+    get_data_dir().join("settings.json")
+}
+
 /// Configuration loaded from config.txt
 #[derive(Debug, Default)]
 pub struct Config {

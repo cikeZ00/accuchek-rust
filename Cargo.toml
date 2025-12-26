@@ -1,6 +1,6 @@
 [package]
 name = "accuchek"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Download samples from Roche Accu-Chek blood glucose meters via USB"
 authors = ["Ported from C++ original"]
@@ -11,17 +11,17 @@ rusb = "0.9"
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-thiserror = "1.0"
+thiserror = "2.0"
 log = "0.4"
-env_logger = "0.10"
-rusqlite = { version = "0.31", features = ["bundled"] }
+env_logger = "0.11"
+rusqlite = { version = "0.38", features = ["bundled"] }
 
 # GUI dependencies
 eframe = "0.29"
 egui_plot = "0.29"
-rfd = "0.15"  # Native file dialogs
-printpdf = "0.7"  # PDF generation
-dirs = "5.0"  # OS-specific directories
+rfd = "0.16"  # Native file dialogs
+printpdf = "0.8"  # PDF generation
+dirs = "6.0"  # OS-specific directories
 
 [target.'cfg(windows)'.dependencies]
 # Windows-specific dependencies if needed
