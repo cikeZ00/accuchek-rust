@@ -1034,13 +1034,21 @@ pub fn run_gui(db_path: String) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1024.0, 768.0])
-            .with_min_inner_size([800.0, 600.0]),
+            .with_min_inner_size([800.0, 600.0])
+            .with_transparent(false),
+        vsync: true,
+        multisampling: 0,
+        depth_buffer: 0,
         ..Default::default()
     };
     
     eframe::run_native(
         "Accu-Chek Data Manager",
         options,
-        Box::new(|cc| Ok(Box::new(AccuChekApp::new(cc, db_path)))),
+        Box::new(|cc| {
+            // Set to reactive mode - only repaint on input events, not continuously
+            cc.egui_ctx.set_visuals(egui::Visuals::default());
+            Ok(Box::new(AccuChekApp::new(cc, db_path)))
+        }),
     )
 }
