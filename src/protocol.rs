@@ -33,7 +33,7 @@ pub const ACTION_TYPE_MDC_ACT_SEG_GET_ID_LIST: u16 = 0x0C1E;
 pub const ACTION_TYPE_MDC_ACT_SEG_TRIG_XFER: u16 = 0x0C1C;
 pub const ACTION_TYPE_MDC_ACT_SEG_SET_TIME: u16 = 0x0C17;
 
-// MDC Constants
+// MDC Object Class Constants
 pub const MDC_MOC_VMO_METRIC: u16 = 4;
 pub const MDC_MOC_VMO_METRIC_ENUM: u16 = 5;
 pub const MDC_MOC_VMO_METRIC_NU: u16 = 6;
@@ -45,6 +45,8 @@ pub const MDC_MOC_SCAN_CFG_PERI: u16 = 19;
 pub const MDC_MOC_VMS_MDS_SIMP: u16 = 37;
 pub const MDC_MOC_VMO_PMSTORE: u16 = 61;
 pub const MDC_MOC_PM_SEGMENT: u16 = 62;
+
+// MDC Attribute Constants
 pub const MDC_ATTR_CONFIRM_MODE: u16 = 2323;
 pub const MDC_ATTR_CONFIRM_TIMEOUT: u16 = 2324;
 pub const MDC_ATTR_TRANSPORT_TIMEOUT: u16 = 2694;
@@ -128,25 +130,6 @@ pub const MDC_ATTR_TIME_STAMP_BO: u16 = 2690;
 pub const MDC_ATTR_TIME_START_SEG_BO: u16 = 2691;
 pub const MDC_ATTR_TIME_END_SEG_BO: u16 = 2692;
 
-/// Get the name of a MDC constant by its value
-pub fn find_mdc_name(value: u16) -> Option<&'static str> {
-    match value {
-        4 => Some("MDC_MOC_VMO_METRIC"),
-        5 => Some("MDC_MOC_VMO_METRIC_ENUM"),
-        6 => Some("MDC_MOC_VMO_METRIC_NU"),
-        9 => Some("MDC_MOC_VMO_METRIC_SA_RT"),
-        16 => Some("MDC_MOC_SCAN"),
-        17 => Some("MDC_MOC_SCAN_CFG"),
-        18 => Some("MDC_MOC_SCAN_CFG_EPI"),
-        19 => Some("MDC_MOC_SCAN_CFG_PERI"),
-        37 => Some("MDC_MOC_VMS_MDS_SIMP"),
-        61 => Some("MDC_MOC_VMO_PMSTORE"),
-        62 => Some("MDC_MOC_PM_SEGMENT"),
-        2385 => Some("MDC_ATTR_NUM_SEG"),
-        _ => None,
-    }
-}
-
 /// Write a big-endian u16 to a buffer
 pub fn write_be16(buffer: &mut Vec<u8>, value: u16) {
     buffer.push((value >> 8) as u8);
@@ -197,8 +180,7 @@ pub fn hex_dump(buffer: &[u8]) {
         
         // Build ASCII representation
         let mut ascii_part = String::new();
-        for j in i..end {
-            let c = buffer[j];
+        for &c in buffer.iter().take(end).skip(i) {
             if c.is_ascii_graphic() || c == b' ' {
                 ascii_part.push(c as char);
             } else {
@@ -207,7 +189,7 @@ pub fn hex_dump(buffer: &[u8]) {
         }
         
         info!("{}   {}", hex_part, ascii_part);
-        i = i + 16;
+        i += 16;
     }
 }
 

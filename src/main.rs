@@ -20,6 +20,8 @@ mod protocol;
 mod device;
 mod config;
 mod error;
+mod units;
+mod stats;
 mod storage;
 mod gui;
 mod export;
@@ -51,8 +53,8 @@ fn attach_console() {
     unsafe {
         // Try to attach to the parent console (e.g., PowerShell, cmd)
         if AttachConsole(ATTACH_PARENT_PROCESS) != 0 {
-            let conout = b"CONOUT$\0".as_ptr() as *const i8;
-            let mode_w = b"w\0".as_ptr() as *const i8;
+            let conout = c"CONOUT$".as_ptr();
+            let mode_w = c"w".as_ptr();
             
             // Redirect stdout (stream 1) and stderr (stream 2) to console
             freopen(conout, mode_w, __acrt_iob_func(1)); // stdout

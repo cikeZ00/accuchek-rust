@@ -1,1016 +1,937 @@
 //! PDF Export functionality for glucose readings
+//!
+//! This module provides a clean, modular PDF exporter that generates
+//! comprehensive glucose reports with multiple visualization pages.
 
 use printpdf::*;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-use crate::storage::{StoredReading, TimeInRange, DailyStats, HourlyStats, TimeBinStats, DailyTIR, HistogramBin};
+use crate::storage::StoredReading;
+use crate::units::{GlucoseUnit, Thresholds, GlucoseRange};
+use crate::stats::ExportStatistics;
 
-/// PDF document dimensions (A4)
+// ============= Chart Axis Ranges =============
+
+/// Axis ranges for mg/dL charts
+const MGDL_Y_MIN: f32 = 40.0;
+const MGDL_Y_MAX: f32 = 300.0;
+const MGDL_AXIS_LABELS: [u16; 5] = [50, 100, 150, 200, 250];
+
+/// Axis ranges for mmol/L charts
+const MMOL_Y_MIN: f32 = 2.0;
+const MMOL_Y_MAX: f32 = 17.0;
+const MMOL_AXIS_LABELS: [f32; 6] = [3.0, 5.0, 7.0, 10.0, 13.0, 16.0];
+
+// ============= Constants =============
+
 const PAGE_WIDTH_MM: f32 = 210.0;
 const PAGE_HEIGHT_MM: f32 = 297.0;
 const MARGIN_MM: f32 = 20.0;
 
-/// Colors
-const COLOR_RED: Color = Color::Rgb(Rgb { r: 0.9, g: 0.3, b: 0.3, icc_profile: None });
-const COLOR_GREEN: Color = Color::Rgb(Rgb { r: 0.3, g: 0.7, b: 0.3, icc_profile: None });
-const COLOR_ORANGE: Color = Color::Rgb(Rgb { r: 0.9, g: 0.6, b: 0.3, icc_profile: None });
-const COLOR_BLUE: Color = Color::Rgb(Rgb { r: 0.3, g: 0.5, b: 0.8, icc_profile: None });
-const COLOR_BLACK: Color = Color::Rgb(Rgb { r: 0.0, g: 0.0, b: 0.0, icc_profile: None });
-const COLOR_GRAY: Color = Color::Rgb(Rgb { r: 0.5, g: 0.5, b: 0.5, icc_profile: None });
-const COLOR_LIGHT_GRAY: Color = Color::Rgb(Rgb { r: 0.9, g: 0.9, b: 0.9, icc_profile: None });
+// ============= Colors =============
 
-fn color_tuple(r: f32, g: f32, b: f32) -> Color {
-    Color::Rgb(Rgb { r, g, b, icc_profile: None })
-}
+struct PdfColors;
 
-/// Export readings to PDF
-pub fn export_to_pdf<P: AsRef<Path>>(
-    path: P,
-    readings: &[StoredReading],
-    time_in_range: Option<&TimeInRange>,
-    daily_stats: &[DailyStats],
-    low_threshold: u16,
-    high_threshold: u16,
-    hourly_stats: &[HourlyStats],
-    time_bin_stats: &[TimeBinStats],
-    daily_tir: &[DailyTIR],
-    histogram_bins: &[HistogramBin],
-) -> Result<(), String> {
-    let mut doc = PdfDocument::new("Accu-Chek Glucose Report");
-
-    // Page 1: Summary
-    let summary_ops = build_summary_page(readings, time_in_range, low_threshold, high_threshold);
-    let summary_page = PdfPage::new(Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), summary_ops);
-
-    // Page 2: Distribution Histogram
-    let histogram_ops = build_histogram_page(readings, histogram_bins, low_threshold, high_threshold);
-    let histogram_page = PdfPage::new(Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), histogram_ops);
-
-    // Page 3: Time-of-Day Analysis
-    let hourly_ops = build_hourly_page(hourly_stats, low_threshold, high_threshold);
-    let hourly_page = PdfPage::new(Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), hourly_ops);
-
-    // Page 4: Time Bins Boxplot
-    let time_bins_ops = build_time_bins_page(time_bin_stats, low_threshold, high_threshold);
-    let time_bins_page = PdfPage::new(Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), time_bins_ops);
-
-    // Page 5: Daily TIR Trend
-    let daily_tir_ops = build_daily_tir_page(daily_tir, low_threshold, high_threshold);
-    let daily_tir_page = PdfPage::new(Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), daily_tir_ops);
-
-    // Page 6: Glucose Trend Chart
-    let chart_ops = build_chart_page(readings, daily_stats, low_threshold, high_threshold);
-    let chart_page = PdfPage::new(Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), chart_ops);
-
-    let mut pages = vec![summary_page, histogram_page, hourly_page, time_bins_page, daily_tir_page, chart_page];
-
-    // Data pages
-    let readings_per_page = 35;
-    let total_pages = (readings.len() + readings_per_page - 1) / readings_per_page;
-
-    for page_num in 0..total_pages {
-        let start_idx = page_num * readings_per_page;
-        let end_idx = std::cmp::min(start_idx + readings_per_page, readings.len());
-        let page_readings = &readings[start_idx..end_idx];
-
-        let data_ops = build_data_page(page_readings, page_num + 1, total_pages, low_threshold, high_threshold);
-        let data_page = PdfPage::new(Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), data_ops);
-        pages.push(data_page);
+impl PdfColors {
+    fn red() -> Color {
+        Color::Rgb(Rgb { r: 0.9, g: 0.3, b: 0.3, icc_profile: None })
     }
-
-    doc.with_pages(pages);
-
-    // Save the PDF
-    let mut warnings = Vec::new();
-    let bytes = doc.save(&PdfSaveOptions::default(), &mut warnings);
     
-    let mut file = File::create(path.as_ref())
-        .map_err(|e| format!("Failed to create file: {}", e))?;
-    file.write_all(&bytes)
-        .map_err(|e| format!("Failed to write PDF: {}", e))?;
-
-    Ok(())
-}
-
-// Helper to create text operations
-fn text_ops(text: &str, size: f32, x: f32, y: f32, font: BuiltinFont, color: Color) -> Vec<Op> {
-    vec![
-        Op::SetFillColor { col: color },
-        Op::StartTextSection,
-        Op::SetFontSizeBuiltinFont { size: Pt(size), font },
-        Op::SetTextCursor { pos: Point::new(Mm(x), Mm(y)) },
-        Op::WriteTextBuiltinFont { 
-            items: vec![TextItem::Text(text.to_string())],
-            font,
-        },
-        Op::EndTextSection,
-    ]
-}
-
-fn line_ops(x1: f32, y1: f32, x2: f32, y2: f32, color: Color, width: f32) -> Vec<Op> {
-    vec![
-        Op::SetOutlineColor { col: color },
-        Op::SetOutlineThickness { pt: Pt(width) },
-        Op::DrawLine {
-            line: Line {
-                points: vec![
-                    LinePoint { p: Point::new(Mm(x1), Mm(y1)), bezier: false },
-                    LinePoint { p: Point::new(Mm(x2), Mm(y2)), bezier: false },
-                ],
-                is_closed: false,
-            },
-        },
-    ]
-}
-
-fn rect_fill_ops(x: f32, y: f32, width: f32, height: f32, color: Color) -> Vec<Op> {
-    vec![
-        Op::SetFillColor { col: color },
-        Op::DrawPolygon {
-            polygon: Polygon {
-                rings: vec![PolygonRing {
-                    points: vec![
-                        LinePoint { p: Point::new(Mm(x), Mm(y)), bezier: false },
-                        LinePoint { p: Point::new(Mm(x + width), Mm(y)), bezier: false },
-                        LinePoint { p: Point::new(Mm(x + width), Mm(y + height)), bezier: false },
-                        LinePoint { p: Point::new(Mm(x), Mm(y + height)), bezier: false },
-                    ],
-                }],
-                mode: PaintMode::Fill,
-                winding_order: WindingOrder::NonZero,
-            },
-        },
-    ]
-}
-
-fn rect_stroke_ops(x: f32, y: f32, width: f32, height: f32, color: Color, stroke_width: f32) -> Vec<Op> {
-    vec![
-        Op::SetOutlineColor { col: color },
-        Op::SetOutlineThickness { pt: Pt(stroke_width) },
-        Op::DrawPolygon {
-            polygon: Polygon {
-                rings: vec![PolygonRing {
-                    points: vec![
-                        LinePoint { p: Point::new(Mm(x), Mm(y)), bezier: false },
-                        LinePoint { p: Point::new(Mm(x + width), Mm(y)), bezier: false },
-                        LinePoint { p: Point::new(Mm(x + width), Mm(y + height)), bezier: false },
-                        LinePoint { p: Point::new(Mm(x), Mm(y + height)), bezier: false },
-                    ],
-                }],
-                mode: PaintMode::Stroke,
-                winding_order: WindingOrder::NonZero,
-            },
-        },
-    ]
-}
-
-fn bar_ops(x: f32, y: f32, width: f32, height: f32, fill_pct: f32, fill_color: Color, bg_color: Color) -> Vec<Op> {
-    let mut ops = Vec::new();
-    // Background
-    ops.extend(rect_fill_ops(x, y, width, height, bg_color));
-    // Filled portion
-    if fill_pct > 0.0 {
-        ops.extend(rect_fill_ops(x, y, width * fill_pct.min(1.0), height, fill_color));
+    fn green() -> Color {
+        Color::Rgb(Rgb { r: 0.3, g: 0.7, b: 0.3, icc_profile: None })
     }
-    // Border
-    ops.extend(rect_stroke_ops(x, y, width, height, COLOR_GRAY, 0.3));
-    ops
-}
+    
+    fn orange() -> Color {
+        Color::Rgb(Rgb { r: 0.9, g: 0.6, b: 0.3, icc_profile: None })
+    }
+    
+    fn blue() -> Color {
+        Color::Rgb(Rgb { r: 0.3, g: 0.5, b: 0.8, icc_profile: None })
+    }
+    
+    fn black() -> Color {
+        Color::Rgb(Rgb { r: 0.0, g: 0.0, b: 0.0, icc_profile: None })
+    }
+    
+    fn gray() -> Color {
+        Color::Rgb(Rgb { r: 0.5, g: 0.5, b: 0.5, icc_profile: None })
+    }
+    
+    fn light_gray() -> Color {
+        Color::Rgb(Rgb { r: 0.9, g: 0.9, b: 0.9, icc_profile: None })
+    }
+    
+    fn for_range(range: GlucoseRange) -> Color {
+        match range {
+            GlucoseRange::VeryLow => Color::Rgb(Rgb { r: 0.8, g: 0.2, b: 0.2, icc_profile: None }),
+            GlucoseRange::Low => Self::red(),
+            GlucoseRange::InRange => Self::green(),
+            GlucoseRange::High => Self::orange(),
+            GlucoseRange::VeryHigh => Color::Rgb(Rgb { r: 0.9, g: 0.3, b: 0.2, icc_profile: None }),
+        }
+    }
+    
+    fn for_value(mg_dl: u16, thresholds: &Thresholds) -> Color {
+        Self::for_range(thresholds.classify(mg_dl))
+    }
 
-fn point_ops(x: f32, y: f32, radius: f32, color: Color) -> Vec<Op> {
-    rect_fill_ops(x - radius, y - radius, radius * 2.0, radius * 2.0, color)
-}
-
-fn get_reading_color(mg_dl: u16, low_threshold: u16, high_threshold: u16) -> Color {
-    if mg_dl < low_threshold {
-        COLOR_RED
-    } else if mg_dl > high_threshold {
-        COLOR_ORANGE
-    } else {
-        COLOR_GREEN
+    fn for_mmol_value(mmol: f64, thresholds: &Thresholds) -> Color {
+        // Convert mmol thresholds comparison
+        if mmol < Thresholds::VERY_LOW_MMOL {
+            Self::for_range(GlucoseRange::VeryLow)
+        } else if mmol < thresholds.low_mmol {
+            Self::for_range(GlucoseRange::Low)
+        } else if mmol <= thresholds.high_mmol {
+            Self::for_range(GlucoseRange::InRange)
+        } else if mmol <= Thresholds::VERY_HIGH_MMOL {
+            Self::for_range(GlucoseRange::High)
+        } else {
+            Self::for_range(GlucoseRange::VeryHigh)
+        }
     }
 }
 
-fn build_summary_page(
-    readings: &[StoredReading],
-    time_in_range: Option<&TimeInRange>,
-    low_threshold: u16,
-    high_threshold: u16,
-) -> Vec<Op> {
-    let mut ops = Vec::new();
-    let mut y = PAGE_HEIGHT_MM - MARGIN_MM;
+// ============= PDF Drawing Helpers =============
 
-    // Title
-    ops.extend(text_ops("Accu-Chek Glucose Report", 24.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    y -= 10.0;
+struct PdfOps;
 
-    // Date
-    let date_str = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
-    ops.extend(text_ops(&format!("Generated: {}", date_str), 10.0, MARGIN_MM, y, BuiltinFont::Helvetica, COLOR_GRAY));
-    y -= 15.0;
+impl PdfOps {
+    fn text(text: &str, size: f32, x: f32, y: f32, font: BuiltinFont, color: Color) -> Vec<Op> {
+        vec![
+            Op::SetFillColor { col: color },
+            Op::StartTextSection,
+            Op::SetFontSizeBuiltinFont { size: Pt(size), font },
+            Op::SetTextCursor { pos: Point::new(Mm(x), Mm(y)) },
+            Op::WriteTextBuiltinFont { 
+                items: vec![TextItem::Text(text.to_string())],
+                font,
+            },
+            Op::EndTextSection,
+        ]
+    }
 
-    // Horizontal line
-    ops.extend(line_ops(MARGIN_MM, y, PAGE_WIDTH_MM - MARGIN_MM, y, COLOR_GRAY, 0.5));
-    y -= 15.0;
+    fn line(x1: f32, y1: f32, x2: f32, y2: f32, color: Color, width: f32) -> Vec<Op> {
+        vec![
+            Op::SetOutlineColor { col: color },
+            Op::SetOutlineThickness { pt: Pt(width) },
+            Op::DrawLine {
+                line: Line {
+                    points: vec![
+                        LinePoint { p: Point::new(Mm(x1), Mm(y1)), bezier: false },
+                        LinePoint { p: Point::new(Mm(x2), Mm(y2)), bezier: false },
+                    ],
+                    is_closed: false,
+                },
+            },
+        ]
+    }
 
-    // Summary Statistics
-    ops.extend(text_ops("Summary Statistics", 14.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    y -= 10.0;
+    fn rect_fill(x: f32, y: f32, width: f32, height: f32, color: Color) -> Vec<Op> {
+        vec![
+            Op::SetFillColor { col: color },
+            Op::DrawPolygon {
+                polygon: Polygon {
+                    rings: vec![PolygonRing {
+                        points: vec![
+                            LinePoint { p: Point::new(Mm(x), Mm(y)), bezier: false },
+                            LinePoint { p: Point::new(Mm(x + width), Mm(y)), bezier: false },
+                            LinePoint { p: Point::new(Mm(x + width), Mm(y + height)), bezier: false },
+                            LinePoint { p: Point::new(Mm(x), Mm(y + height)), bezier: false },
+                        ],
+                    }],
+                    mode: PaintMode::Fill,
+                    winding_order: WindingOrder::NonZero,
+                },
+            },
+        ]
+    }
 
-    if !readings.is_empty() {
-        let total = readings.len();
-        let avg: f64 = readings.iter().map(|r| r.mg_dl as f64).sum::<f64>() / total as f64;
-        let min = readings.iter().map(|r| r.mg_dl).min().unwrap_or(0);
-        let max = readings.iter().map(|r| r.mg_dl).max().unwrap_or(0);
+    fn rect_stroke(x: f32, y: f32, width: f32, height: f32, color: Color, stroke_width: f32) -> Vec<Op> {
+        vec![
+            Op::SetOutlineColor { col: color },
+            Op::SetOutlineThickness { pt: Pt(stroke_width) },
+            Op::DrawPolygon {
+                polygon: Polygon {
+                    rings: vec![PolygonRing {
+                        points: vec![
+                            LinePoint { p: Point::new(Mm(x), Mm(y)), bezier: false },
+                            LinePoint { p: Point::new(Mm(x + width), Mm(y)), bezier: false },
+                            LinePoint { p: Point::new(Mm(x + width), Mm(y + height)), bezier: false },
+                            LinePoint { p: Point::new(Mm(x), Mm(y + height)), bezier: false },
+                        ],
+                    }],
+                    mode: PaintMode::Stroke,
+                    winding_order: WindingOrder::NonZero,
+                },
+            },
+        ]
+    }
 
-        let first_date = readings.first().map(|r| r.timestamp.as_str()).unwrap_or("N/A");
-        let last_date = readings.last().map(|r| r.timestamp.as_str()).unwrap_or("N/A");
+    fn progress_bar(x: f32, y: f32, width: f32, height: f32, fill_pct: f32, fill_color: Color) -> Vec<Op> {
+        let mut ops = Vec::new();
+        ops.extend(Self::rect_fill(x, y, width, height, PdfColors::light_gray()));
+        if fill_pct > 0.0 {
+            ops.extend(Self::rect_fill(x, y, width * fill_pct.min(1.0), height, fill_color));
+        }
+        ops.extend(Self::rect_stroke(x, y, width, height, PdfColors::gray(), 0.3));
+        ops
+    }
 
-        ops.extend(text_ops(&format!("Total Readings: {}", total), 11.0, MARGIN_MM + 5.0, y, BuiltinFont::Helvetica, COLOR_BLACK));
-        y -= 7.0;
-        ops.extend(text_ops(&format!("Date Range: {} to {}", first_date, last_date), 11.0, MARGIN_MM + 5.0, y, BuiltinFont::Helvetica, COLOR_BLACK));
-        y -= 7.0;
-        ops.extend(text_ops(&format!("Average: {:.1} mg/dL ({:.2} mmol/L)", avg, avg / 18.0), 11.0, MARGIN_MM + 5.0, y, BuiltinFont::Helvetica, COLOR_BLACK));
-        y -= 7.0;
+    fn point(x: f32, y: f32, radius: f32, color: Color) -> Vec<Op> {
+        Self::rect_fill(x - radius, y - radius, radius * 2.0, radius * 2.0, color)
+    }
+}
+
+// ============= PDF Exporter =============
+
+pub struct PdfExporter<'a> {
+    readings: &'a [StoredReading],
+    stats: &'a ExportStatistics,
+    thresholds: Thresholds,
+    unit: GlucoseUnit,
+}
+
+impl<'a> PdfExporter<'a> {
+    pub fn new(
+        readings: &'a [StoredReading],
+        stats: &'a ExportStatistics,
+        thresholds: Thresholds,
+        unit: GlucoseUnit,
+    ) -> Self {
+        Self { readings, stats, thresholds, unit }
+    }
+
+    /// Get Y-axis range for charts based on unit
+    fn y_range(&self) -> (f32, f32) {
+        match self.unit {
+            GlucoseUnit::MgDl => (MGDL_Y_MIN, MGDL_Y_MAX),
+            GlucoseUnit::MmolL => (MMOL_Y_MIN, MMOL_Y_MAX),
+        }
+    }
+
+    /// Get low threshold in current unit
+    fn threshold_low(&self) -> f32 {
+        match self.unit {
+            GlucoseUnit::MgDl => self.thresholds.low_mgdl as f32,
+            GlucoseUnit::MmolL => self.thresholds.low_mmol as f32,
+        }
+    }
+
+    /// Get high threshold in current unit
+    fn threshold_high(&self) -> f32 {
+        match self.unit {
+            GlucoseUnit::MgDl => self.thresholds.high_mgdl as f32,
+            GlucoseUnit::MmolL => self.thresholds.high_mmol as f32,
+        }
+    }
+
+    /// Get glucose value from reading in current unit
+    fn reading_value(&self, reading: &StoredReading) -> f32 {
+        match self.unit {
+            GlucoseUnit::MgDl => reading.mg_dl as f32,
+            GlucoseUnit::MmolL => reading.mmol_l as f32,
+        }
+    }
+
+    /// Get color for a value in the current unit
+    fn value_color(&self, mg_dl: u16, mmol: f64) -> Color {
+        match self.unit {
+            GlucoseUnit::MgDl => PdfColors::for_value(mg_dl, &self.thresholds),
+            GlucoseUnit::MmolL => PdfColors::for_mmol_value(mmol, &self.thresholds),
+        }
+    }
+
+    pub fn export<P: AsRef<Path>>(&self, path: P) -> Result<(), String> {
+        let mut doc = PdfDocument::new("Accu-Chek Glucose Report");
+
+        let mut pages = vec![
+            self.build_summary_page(),
+            self.build_histogram_page(),
+            self.build_hourly_page(),
+            self.build_time_bins_page(),
+            self.build_daily_tir_page(),
+            self.build_chart_page(),
+        ];
+
+        // Add data pages
+        let readings_per_page = 35;
+        let total_pages = self.readings.len().div_ceil(readings_per_page);
+
+        for page_num in 0..total_pages {
+            let start_idx = page_num * readings_per_page;
+            let end_idx = std::cmp::min(start_idx + readings_per_page, self.readings.len());
+            let page_readings = &self.readings[start_idx..end_idx];
+            pages.push(self.build_data_page(page_readings, page_num + 1, total_pages));
+        }
+
+        doc.with_pages(pages);
+
+        let mut warnings = Vec::new();
+        let bytes = doc.save(&PdfSaveOptions::default(), &mut warnings);
         
-        let min_color = get_reading_color(min, low_threshold, high_threshold);
-        ops.extend(text_ops(&format!("Minimum: {} mg/dL", min), 11.0, MARGIN_MM + 5.0, y, BuiltinFont::Helvetica, min_color));
-        y -= 7.0;
-        
-        let max_color = get_reading_color(max, low_threshold, high_threshold);
-        ops.extend(text_ops(&format!("Maximum: {} mg/dL", max), 11.0, MARGIN_MM + 5.0, y, BuiltinFont::Helvetica, max_color));
+        let mut file = File::create(path.as_ref())
+            .map_err(|e| format!("Failed to create file: {}", e))?;
+        file.write_all(&bytes)
+            .map_err(|e| format!("Failed to write PDF: {}", e))?;
+
+        Ok(())
+    }
+
+    fn build_summary_page(&self) -> PdfPage {
+        let mut ops = Vec::new();
+        let mut y = PAGE_HEIGHT_MM - MARGIN_MM;
+
+        // Title
+        ops.extend(PdfOps::text("Accu-Chek Glucose Report", 24.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, PdfColors::black()));
+        y -= 10.0;
+
+        // Date
+        let date_str = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+        ops.extend(PdfOps::text(&format!("Generated: {}", date_str), 10.0, MARGIN_MM, y, BuiltinFont::Helvetica, PdfColors::gray()));
         y -= 15.0;
-    }
 
-    // Time in Range section
-    ops.extend(text_ops(&format!("Time in Range ({}-{} mg/dL)", low_threshold, high_threshold), 14.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    y -= 12.0;
+        ops.extend(PdfOps::line(MARGIN_MM, y, PAGE_WIDTH_MM - MARGIN_MM, y, PdfColors::gray(), 0.5));
+        y -= 15.0;
 
-    if let Some(tir) = time_in_range {
+        // Summary Statistics
+        ops.extend(PdfOps::text("Summary Statistics", 14.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, PdfColors::black()));
+        y -= 10.0;
+
+        if !self.readings.is_empty() {
+            let stats = &self.stats.basic;
+            let first_date = self.readings.first().map(|r| r.timestamp.as_str()).unwrap_or("N/A");
+            let last_date = self.readings.last().map(|r| r.timestamp.as_str()).unwrap_or("N/A");
+
+            ops.extend(PdfOps::text(&format!("Total Readings: {}", stats.mgdl.count), 11.0, MARGIN_MM + 5.0, y, BuiltinFont::Helvetica, PdfColors::black()));
+            y -= 7.0;
+            ops.extend(PdfOps::text(&format!("Date Range: {} to {}", first_date, last_date), 11.0, MARGIN_MM + 5.0, y, BuiltinFont::Helvetica, PdfColors::black()));
+            y -= 7.0;
+            
+            ops.extend(PdfOps::text(&format!("Average: {:.1} mg/dL ({:.2} mmol/L)", stats.mgdl.mean, stats.mmol.mean), 11.0, MARGIN_MM + 5.0, y, BuiltinFont::Helvetica, PdfColors::black()));
+            y -= 7.0;
+            
+            ops.extend(PdfOps::text(&format!("Minimum: {} mg/dL ({:.1} mmol/L)", stats.mgdl.min, stats.mmol.min), 11.0, MARGIN_MM + 5.0, y, BuiltinFont::Helvetica, PdfColors::for_value(stats.mgdl.min, &self.thresholds)));
+            y -= 7.0;
+            
+            ops.extend(PdfOps::text(&format!("Maximum: {} mg/dL ({:.1} mmol/L)", stats.mgdl.max, stats.mmol.max), 11.0, MARGIN_MM + 5.0, y, BuiltinFont::Helvetica, PdfColors::for_value(stats.mgdl.max, &self.thresholds)));
+            y -= 15.0;
+        }
+
+        // Time in Range section
+        let range_label = match self.unit {
+            GlucoseUnit::MgDl => format!("Time in Range ({}-{} mg/dL)", self.thresholds.low_mgdl, self.thresholds.high_mgdl),
+            GlucoseUnit::MmolL => format!("Time in Range ({:.1}-{:.1} mmol/L)", self.thresholds.low_mmol, self.thresholds.high_mmol),
+        };
+        ops.extend(PdfOps::text(&range_label, 14.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, PdfColors::black()));
+        y -= 12.0;
+
+        let tir = &self.stats.tir;
         let label_width = 45.0;
         let bar_width = 80.0;
         let bar_height = 12.0;
         let bar_x = MARGIN_MM + label_width;
 
         // Low
-        ops.extend(text_ops("Low:", 10.0, MARGIN_MM, y - 3.0, BuiltinFont::Helvetica, COLOR_BLACK));
-        ops.extend(bar_ops(bar_x, y - 5.0, bar_width, bar_height, tir.low_percent as f32 / 100.0, COLOR_RED, COLOR_LIGHT_GRAY));
-        ops.extend(text_ops(&format!("{:.1}% ({} readings)", tir.low_percent, tir.low), 9.0, bar_x + bar_width + 3.0, y - 3.0, BuiltinFont::Helvetica, COLOR_BLACK));
+        ops.extend(PdfOps::text("Low:", 10.0, MARGIN_MM, y - 3.0, BuiltinFont::Helvetica, PdfColors::black()));
+        ops.extend(PdfOps::progress_bar(bar_x, y - 5.0, bar_width, bar_height, tir.low_percent() as f32 / 100.0, PdfColors::red()));
+        ops.extend(PdfOps::text(&format!("{:.1}% ({} readings)", tir.low_percent(), tir.total_low()), 9.0, bar_x + bar_width + 3.0, y - 3.0, BuiltinFont::Helvetica, PdfColors::black()));
         y -= 15.0;
 
         // In Range
-        ops.extend(text_ops("In Range:", 10.0, MARGIN_MM, y - 3.0, BuiltinFont::Helvetica, COLOR_BLACK));
-        ops.extend(bar_ops(bar_x, y - 5.0, bar_width, bar_height, tir.normal_percent as f32 / 100.0, COLOR_GREEN, COLOR_LIGHT_GRAY));
-        ops.extend(text_ops(&format!("{:.1}% ({} readings)", tir.normal_percent, tir.normal), 9.0, bar_x + bar_width + 3.0, y - 3.0, BuiltinFont::Helvetica, COLOR_BLACK));
+        ops.extend(PdfOps::text("In Range:", 10.0, MARGIN_MM, y - 3.0, BuiltinFont::Helvetica, PdfColors::black()));
+        ops.extend(PdfOps::progress_bar(bar_x, y - 5.0, bar_width, bar_height, tir.in_range_percent() as f32 / 100.0, PdfColors::green()));
+        ops.extend(PdfOps::text(&format!("{:.1}% ({} readings)", tir.in_range_percent(), tir.in_range), 9.0, bar_x + bar_width + 3.0, y - 3.0, BuiltinFont::Helvetica, PdfColors::black()));
         y -= 15.0;
 
         // High
-        ops.extend(text_ops("High:", 10.0, MARGIN_MM, y - 3.0, BuiltinFont::Helvetica, COLOR_BLACK));
-        ops.extend(bar_ops(bar_x, y - 5.0, bar_width, bar_height, tir.high_percent as f32 / 100.0, COLOR_ORANGE, COLOR_LIGHT_GRAY));
-        ops.extend(text_ops(&format!("{:.1}% ({} readings)", tir.high_percent, tir.high), 9.0, bar_x + bar_width + 3.0, y - 3.0, BuiltinFont::Helvetica, COLOR_BLACK));
+        ops.extend(PdfOps::text("High:", 10.0, MARGIN_MM, y - 3.0, BuiltinFont::Helvetica, PdfColors::black()));
+        ops.extend(PdfOps::progress_bar(bar_x, y - 5.0, bar_width, bar_height, tir.high_percent() as f32 / 100.0, PdfColors::orange()));
+        ops.extend(PdfOps::text(&format!("{:.1}% ({} readings)", tir.high_percent(), tir.total_high()), 9.0, bar_x + bar_width + 3.0, y - 3.0, BuiltinFont::Helvetica, PdfColors::black()));
         y -= 20.0;
-    }
 
-    // Distribution section
-    ops.extend(text_ops("Reading Distribution", 14.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    y -= 12.0;
+        // Distribution section
+        ops.extend(PdfOps::text("Reading Distribution", 14.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, PdfColors::black()));
+        y -= 12.0;
 
-    if !readings.is_empty() {
-        // Clinical thresholds for dangerous levels (fixed)
-        const VERY_LOW_THRESHOLD: u16 = 54;  // Severe hypoglycemia
-        const VERY_HIGH_THRESHOLD: u16 = 250; // Risk of ketoacidosis
-        
-        let very_low = readings.iter().filter(|r| r.mg_dl < VERY_LOW_THRESHOLD).count();
-        let low = readings.iter().filter(|r| r.mg_dl >= VERY_LOW_THRESHOLD && r.mg_dl < low_threshold).count();
-        let normal = readings.iter().filter(|r| r.mg_dl >= low_threshold && r.mg_dl <= high_threshold).count();
-        let high = readings.iter().filter(|r| r.mg_dl > high_threshold && r.mg_dl <= VERY_HIGH_THRESHOLD).count();
-        let very_high = readings.iter().filter(|r| r.mg_dl > VERY_HIGH_THRESHOLD).count();
-        let total = readings.len() as f32;
+        let ranges = match self.unit {
+            GlucoseUnit::MgDl => vec![
+                (format!("< {} (Very Low)", Thresholds::VERY_LOW_MGDL), tir.very_low, GlucoseRange::VeryLow),
+                (format!("{}-{} (Low)", Thresholds::VERY_LOW_MGDL, self.thresholds.low_mgdl - 1), tir.low, GlucoseRange::Low),
+                (format!("{}-{} (Target)", self.thresholds.low_mgdl, self.thresholds.high_mgdl), tir.in_range, GlucoseRange::InRange),
+                (format!("{}-{} (High)", self.thresholds.high_mgdl + 1, Thresholds::VERY_HIGH_MGDL), tir.high, GlucoseRange::High),
+                (format!("> {} (Very High)", Thresholds::VERY_HIGH_MGDL), tir.very_high, GlucoseRange::VeryHigh),
+            ],
+            GlucoseUnit::MmolL => vec![
+                (format!("< {:.1} (Very Low)", Thresholds::VERY_LOW_MMOL), tir.very_low, GlucoseRange::VeryLow),
+                (format!("{:.1}-{:.1} (Low)", Thresholds::VERY_LOW_MMOL, self.thresholds.low_mmol - 0.1), tir.low, GlucoseRange::Low),
+                (format!("{:.1}-{:.1} (Target)", self.thresholds.low_mmol, self.thresholds.high_mmol), tir.in_range, GlucoseRange::InRange),
+                (format!("{:.1}-{:.1} (High)", self.thresholds.high_mmol + 0.1, Thresholds::VERY_HIGH_MMOL), tir.high, GlucoseRange::High),
+                (format!("> {:.1} (Very High)", Thresholds::VERY_HIGH_MMOL), tir.very_high, GlucoseRange::VeryHigh),
+            ],
+        };
 
-        let ranges: Vec<(String, usize, Color)> = vec![
-            (format!("< {} (Very Low)", VERY_LOW_THRESHOLD), very_low, color_tuple(0.8, 0.2, 0.2)),
-            (format!("{}-{} (Low)", VERY_LOW_THRESHOLD, low_threshold - 1), low, COLOR_RED),
-            (format!("{}-{} (Target)", low_threshold, high_threshold), normal, COLOR_GREEN),
-            (format!("{}-{} (High)", high_threshold + 1, VERY_HIGH_THRESHOLD), high, COLOR_ORANGE),
-            (format!("> {} (Very High)", VERY_HIGH_THRESHOLD), very_high, color_tuple(0.9, 0.3, 0.2)),
-        ];
-
-        let label_width = 55.0;
-        let bar_width = 70.0;
-        let bar_x = MARGIN_MM + label_width;
-
-        for (label, count, color) in ranges {
+        let total = tir.total as f32;
+        for (label, count, range) in ranges {
             let pct = if total > 0.0 { count as f32 / total } else { 0.0 };
-            ops.extend(text_ops(&label, 9.0, MARGIN_MM, y - 2.0, BuiltinFont::Helvetica, COLOR_BLACK));
-            ops.extend(bar_ops(bar_x, y - 4.0, bar_width, 8.0, pct, color, COLOR_LIGHT_GRAY));
-            ops.extend(text_ops(&format!("{} ({:.1}%)", count, pct * 100.0), 9.0, bar_x + bar_width + 3.0, y - 2.0, BuiltinFont::Helvetica, COLOR_BLACK));
+            ops.extend(PdfOps::text(&label, 9.0, MARGIN_MM, y - 2.0, BuiltinFont::Helvetica, PdfColors::black()));
+            ops.extend(PdfOps::progress_bar(bar_x, y - 4.0, 70.0, 8.0, pct, PdfColors::for_range(range)));
+            ops.extend(PdfOps::text(&format!("{} ({:.1}%)", count, pct * 100.0), 9.0, bar_x + 73.0, y - 2.0, BuiltinFont::Helvetica, PdfColors::black()));
             y -= 10.0;
         }
+
+        // Footer
+        ops.extend(PdfOps::text("Page 1 - Summary", 8.0, MARGIN_MM, MARGIN_MM, BuiltinFont::Helvetica, PdfColors::gray()));
+
+        PdfPage::new(Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), ops)
     }
 
-    // Footer
-    ops.extend(text_ops("Page 1 - Summary", 8.0, MARGIN_MM, MARGIN_MM, BuiltinFont::Helvetica, COLOR_GRAY));
+    fn build_histogram_page(&self) -> PdfPage {
+        let mut ops = Vec::new();
+        let mut y = PAGE_HEIGHT_MM - MARGIN_MM;
 
-    ops
-}
-
-fn build_chart_page(
-    readings: &[StoredReading],
-    _daily_stats: &[DailyStats],
-    low_threshold: u16,
-    high_threshold: u16,
-) -> Vec<Op> {
-    let mut ops = Vec::new();
-    let mut y = PAGE_HEIGHT_MM - MARGIN_MM;
-
-    // Title
-    ops.extend(text_ops("Glucose Trend Chart", 16.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    y -= 20.0;
-
-    if readings.is_empty() {
-        ops.extend(text_ops("No data to display", 12.0, MARGIN_MM, y, BuiltinFont::Helvetica, COLOR_GRAY));
-        return ops;
-    }
-
-    // Chart area
-    let chart_x = MARGIN_MM + 15.0;
-    let chart_y = y - 120.0;
-    let chart_width = PAGE_WIDTH_MM - 2.0 * MARGIN_MM - 20.0;
-    let chart_height = 100.0;
-
-    // Draw chart background
-    ops.extend(rect_fill_ops(chart_x, chart_y, chart_width, chart_height, COLOR_LIGHT_GRAY));
-
-    // Draw chart border
-    ops.extend(rect_stroke_ops(chart_x, chart_y, chart_width, chart_height, COLOR_BLACK, 0.5));
-
-    // Y-axis labels and grid
-    let y_min: f32 = 40.0;
-    let y_max: f32 = 300.0;
-    let y_range = y_max - y_min;
-
-    for mg_dl in [50, 100, 150, 200, 250, 300].iter() {
-        let y_pos = chart_y + ((*mg_dl as f32 - y_min) / y_range) * chart_height;
-        if y_pos >= chart_y && y_pos <= chart_y + chart_height {
-            // Grid line
-            ops.extend(line_ops(chart_x, y_pos, chart_x + chart_width, y_pos, color_tuple(0.8, 0.8, 0.8), 0.3));
-            // Label
-            ops.extend(text_ops(&format!("{}", mg_dl), 7.0, MARGIN_MM, y_pos - 1.5, BuiltinFont::Helvetica, COLOR_GRAY));
-        }
-    }
-
-    // Draw threshold lines
-    let low_y = chart_y + ((low_threshold as f32 - y_min) / y_range) * chart_height;
-    let high_y = chart_y + ((high_threshold as f32 - y_min) / y_range) * chart_height;
-    
-    ops.extend(line_ops(chart_x, low_y, chart_x + chart_width, low_y, COLOR_RED, 0.8));
-    ops.extend(line_ops(chart_x, high_y, chart_x + chart_width, high_y, COLOR_ORANGE, 0.8));
-
-    // Draw data points and lines
-    let n = readings.len();
-    if n > 1 {
-        let x_step = chart_width / (n - 1) as f32;
-        
-        // Draw connecting lines
-        for i in 0..n - 1 {
-            let x1 = chart_x + i as f32 * x_step;
-            let x2 = chart_x + (i + 1) as f32 * x_step;
-            let y1 = chart_y + ((readings[i].mg_dl as f32 - y_min) / y_range) * chart_height;
-            let y2 = chart_y + ((readings[i + 1].mg_dl as f32 - y_min) / y_range) * chart_height;
-            
-            let y1_clamped = y1.max(chart_y).min(chart_y + chart_height);
-            let y2_clamped = y2.max(chart_y).min(chart_y + chart_height);
-            
-            ops.extend(line_ops(x1, y1_clamped, x2, y2_clamped, COLOR_BLUE, 0.8));
-        }
-
-        // Draw points
-        for i in 0..n {
-            let x = chart_x + i as f32 * x_step;
-            let y_val = ((readings[i].mg_dl as f32 - y_min) / y_range) * chart_height;
-            let y_pos = (chart_y + y_val).max(chart_y).min(chart_y + chart_height);
-            let color = get_reading_color(readings[i].mg_dl, low_threshold, high_threshold);
-            ops.extend(point_ops(x, y_pos, 1.5, color));
-        }
-    }
-
-    y = chart_y - 15.0;
-
-    // Legend
-    ops.extend(text_ops("Legend:", 10.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    y -= 8.0;
-    
-    ops.extend(line_ops(MARGIN_MM, y + 2.0, MARGIN_MM + 12.0, y + 2.0, COLOR_BLUE, 1.0));
-    ops.extend(text_ops("Glucose readings", 9.0, MARGIN_MM + 15.0, y, BuiltinFont::Helvetica, COLOR_BLACK));
-    
-    ops.extend(line_ops(MARGIN_MM + 70.0, y + 2.0, MARGIN_MM + 82.0, y + 2.0, COLOR_RED, 1.0));
-    ops.extend(text_ops(&format!("Low ({})", low_threshold), 9.0, MARGIN_MM + 85.0, y, BuiltinFont::Helvetica, COLOR_BLACK));
-    
-    ops.extend(line_ops(MARGIN_MM + 120.0, y + 2.0, MARGIN_MM + 132.0, y + 2.0, COLOR_ORANGE, 1.0));
-    ops.extend(text_ops(&format!("High ({})", high_threshold), 9.0, MARGIN_MM + 135.0, y, BuiltinFont::Helvetica, COLOR_BLACK));
-
-    // Footer
-    ops.extend(text_ops("Page 6 - Glucose Trend Chart", 8.0, MARGIN_MM, MARGIN_MM, BuiltinFont::Helvetica, COLOR_GRAY));
-
-    ops
-}
-
-fn build_data_page(
-    readings: &[StoredReading],
-    page_num: usize,
-    total_pages: usize,
-    low_threshold: u16,
-    high_threshold: u16,
-) -> Vec<Op> {
-    let mut ops = Vec::new();
-    let mut y = PAGE_HEIGHT_MM - MARGIN_MM;
-
-    // Title
-    ops.extend(text_ops("Glucose Readings", 14.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    y -= 15.0;
-
-    // Table header - 6 columns: Date/Time, mg/dL, mmol/L, Status, Notes, Tags
-    let col_x = [MARGIN_MM, MARGIN_MM + 32.0, MARGIN_MM + 48.0, MARGIN_MM + 64.0, MARGIN_MM + 80.0, MARGIN_MM + 130.0];
-
-    // Header background
-    ops.extend(rect_fill_ops(MARGIN_MM, y - 6.0, PAGE_WIDTH_MM - 2.0 * MARGIN_MM, 8.0, COLOR_LIGHT_GRAY));
-
-    ops.extend(text_ops("Date/Time", 8.0, col_x[0], y - 4.0, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    ops.extend(text_ops("mg/dL", 8.0, col_x[1], y - 4.0, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    ops.extend(text_ops("mmol/L", 8.0, col_x[2], y - 4.0, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    ops.extend(text_ops("Status", 8.0, col_x[3], y - 4.0, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    ops.extend(text_ops("Notes", 8.0, col_x[4], y - 4.0, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    ops.extend(text_ops("Tags", 8.0, col_x[5], y - 4.0, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    y -= 10.0;
-
-    // Horizontal line
-    ops.extend(line_ops(MARGIN_MM, y, PAGE_WIDTH_MM - MARGIN_MM, y, COLOR_GRAY, 0.5));
-    y -= 2.0;
-
-    // Data rows
-    for (row_idx, reading) in readings.iter().enumerate() {
-        let (status_text, status_color) = if reading.mg_dl < low_threshold {
-            ("LOW", COLOR_RED)
-        } else if reading.mg_dl > high_threshold {
-            ("HIGH", COLOR_ORANGE)
-        } else {
-            ("OK", COLOR_GREEN)
+        ops.extend(PdfOps::text("Glucose Distribution Histogram", 16.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, PdfColors::black()));
+        y -= 8.0;
+        let bin_desc = match self.unit {
+            GlucoseUnit::MgDl => "bin width = 20 mg/dL".to_string(),
+            GlucoseUnit::MmolL => "bin width ~1.1 mmol/L".to_string(),
         };
+        ops.extend(PdfOps::text(&format!("n = {} readings | {}", self.readings.len(), bin_desc), 10.0, MARGIN_MM, y, BuiltinFont::Helvetica, PdfColors::gray()));
+        y -= 15.0;
 
-        // Notes column - calculate lines needed first
-        let note = reading.note.as_deref().unwrap_or("-");
-        let note_display = if note.is_empty() { "-" } else { note };
-        let max_note_chars = 35;
-        
-        // Calculate how many lines the note will take
-        let note_lines: Vec<&str> = if note_display.len() <= max_note_chars {
-            vec![note_display]
-        } else {
-            let mut lines = Vec::new();
-            let mut remaining = note_display;
-            while !remaining.is_empty() {
-                let (line, rest) = if remaining.len() <= max_note_chars {
-                    (remaining, "")
-                } else {
-                    let break_at = remaining[..max_note_chars]
-                        .rfind(' ')
-                        .unwrap_or(max_note_chars);
-                    (&remaining[..break_at], remaining[break_at..].trim_start())
-                };
-                lines.push(line);
-                remaining = rest;
-            }
-            lines
-        };
-        
-        let num_lines = note_lines.len();
-        let line_height = 3.5_f32;
-        let row_height = if num_lines > 1 {
-            6.0 + (num_lines as f32 - 1.0) * line_height
-        } else {
-            6.0
-        };
-        
-        y -= row_height;
-        
-        // Draw alternating row background
-        if row_idx % 2 == 1 {
-            ops.extend(rect_fill_ops(MARGIN_MM, y - 1.5, PAGE_WIDTH_MM - 2.0 * MARGIN_MM, row_height + 1.0, color_tuple(0.95, 0.95, 0.95)));
-        }
-        
-        // Calculate vertical center offset for single-line columns
-        let center_offset = if num_lines > 1 {
-            ((num_lines as f32 - 1.0) * line_height) / 2.0
-        } else {
-            0.0
-        };
-        
-        // Draw single-line columns centered vertically
-        let text_y = y + center_offset;
-        let value_color = get_reading_color(reading.mg_dl, low_threshold, high_threshold);
-        
-        ops.extend(text_ops(&reading.timestamp, 7.0, col_x[0], text_y, BuiltinFont::Helvetica, COLOR_BLACK));
-        ops.extend(text_ops(&format!("{}", reading.mg_dl), 7.0, col_x[1], text_y, BuiltinFont::Helvetica, value_color));
-        ops.extend(text_ops(&format!("{:.2}", reading.mmol_l), 7.0, col_x[2], text_y, BuiltinFont::Helvetica, COLOR_BLACK));
-        ops.extend(text_ops(status_text, 7.0, col_x[3], text_y, BuiltinFont::Helvetica, status_color));
-        
-        // Draw notes - multiple lines from top
-        let notes_start_y = y + (num_lines as f32 - 1.0) * line_height;
-        for (i, line) in note_lines.iter().enumerate() {
-            let line_y = notes_start_y - (i as f32 * line_height);
-            let font_size = if num_lines > 1 { 6.0 } else { 7.0 };
-            ops.extend(text_ops(line, font_size, col_x[4], line_y, BuiltinFont::Helvetica, COLOR_BLACK));
-        }
-        
-        // Tags column - centered vertically
-        let tags = reading.tags.as_deref().unwrap_or("-");
-        let tags_display = if tags.is_empty() { "-" } else { tags };
-        ops.extend(text_ops(tags_display, 7.0, col_x[5], text_y, BuiltinFont::Helvetica, COLOR_GRAY));
-    }
-
-    // Footer
-    ops.extend(text_ops(&format!("Page {} of {} - Data", page_num + 6, total_pages + 6), 8.0, MARGIN_MM, MARGIN_MM, BuiltinFont::Helvetica, COLOR_GRAY));
-
-    ops
-}
-
-// ============= NEW VISUALIZATION PAGES =============
-
-fn build_histogram_page(
-    readings: &[StoredReading],
-    histogram_bins: &[HistogramBin],
-    low_threshold: u16,
-    high_threshold: u16,
-) -> Vec<Op> {
-    let mut ops = Vec::new();
-    let mut y = PAGE_HEIGHT_MM - MARGIN_MM;
-
-    // Title
-    ops.extend(text_ops("Glucose Distribution Histogram", 16.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    y -= 8.0;
-    ops.extend(text_ops(&format!("n = {} readings | bin width = 20 mg/dL", readings.len()), 10.0, MARGIN_MM, y, BuiltinFont::Helvetica, COLOR_GRAY));
-    y -= 15.0;
-
-    if histogram_bins.is_empty() || readings.is_empty() {
-        ops.extend(text_ops("No data available", 12.0, MARGIN_MM, y, BuiltinFont::Helvetica, COLOR_GRAY));
-        return ops;
-    }
-
-    // Chart area
-    let chart_x = MARGIN_MM + 15.0;
-    let chart_y = y - 100.0;
-    let chart_width = PAGE_WIDTH_MM - 2.0 * MARGIN_MM - 20.0;
-    let chart_height = 80.0;
-
-    // Draw chart background
-    ops.extend(rect_fill_ops(chart_x, chart_y, chart_width, chart_height, COLOR_LIGHT_GRAY));
-    ops.extend(rect_stroke_ops(chart_x, chart_y, chart_width, chart_height, COLOR_BLACK, 0.5));
-
-    // Find max count for scaling
-    let max_count = histogram_bins.iter().map(|b| b.count).max().unwrap_or(1) as f32;
-    let num_bins = histogram_bins.len() as f32;
-    let bar_width = (chart_width - 10.0) / num_bins;
-
-    // Draw histogram bars
-    for (i, bin) in histogram_bins.iter().enumerate() {
-        let bar_height = (bin.count as f32 / max_count) * (chart_height - 10.0);
-        let bar_x = chart_x + 5.0 + i as f32 * bar_width;
-        let bar_y = chart_y + 5.0;
-
-        let color = if bin.range_end <= low_threshold {
-            COLOR_RED
-        } else if bin.range_start >= high_threshold {
-            COLOR_ORANGE
-        } else {
-            COLOR_GREEN
-        };
-
-        if bin.count > 0 {
-            ops.extend(rect_fill_ops(bar_x, bar_y, bar_width * 0.9, bar_height, color));
-            ops.extend(rect_stroke_ops(bar_x, bar_y, bar_width * 0.9, bar_height, COLOR_BLACK, 0.3));
-        }
-    }
-
-    // X-axis labels (every 4th bin)
-    y = chart_y - 5.0;
-    for (i, bin) in histogram_bins.iter().enumerate() {
-        if i % 4 == 0 {
-            let label_x = chart_x + 5.0 + i as f32 * bar_width;
-            ops.extend(text_ops(&format!("{}", bin.range_start), 6.0, label_x, y, BuiltinFont::Helvetica, COLOR_BLACK));
-        }
-    }
-    ops.extend(text_ops("mg/dL", 8.0, chart_x + chart_width / 2.0 - 10.0, y - 8.0, BuiltinFont::Helvetica, COLOR_BLACK));
-    
-    y -= 25.0;
-
-    // Statistics summary
-    ops.extend(text_ops("Distribution Statistics", 12.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    y -= 10.0;
-
-    let values: Vec<f64> = readings.iter().map(|r| r.mg_dl as f64).collect();
-    let mean = values.iter().sum::<f64>() / values.len() as f64;
-    let mut sorted = values.clone();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let median = sorted[sorted.len() / 2];
-    let variance: f64 = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (values.len() - 1) as f64;
-    let std_dev = variance.sqrt();
-    let se = std_dev / (values.len() as f64).sqrt();
-    let ci_low = mean - 1.96 * se;
-    let ci_high = mean + 1.96 * se;
-
-    ops.extend(text_ops(&format!("Mean: {:.1} mg/dL", mean), 10.0, MARGIN_MM + 5.0, y, BuiltinFont::Helvetica, COLOR_BLACK));
-    y -= 6.0;
-    ops.extend(text_ops(&format!("95% CI: {:.1} - {:.1} mg/dL", ci_low, ci_high), 10.0, MARGIN_MM + 5.0, y, BuiltinFont::Helvetica, COLOR_BLACK));
-    y -= 6.0;
-    ops.extend(text_ops(&format!("Median: {:.1} mg/dL", median), 10.0, MARGIN_MM + 5.0, y, BuiltinFont::Helvetica, COLOR_BLACK));
-    y -= 6.0;
-    ops.extend(text_ops(&format!("Standard Deviation: {:.1} mg/dL", std_dev), 10.0, MARGIN_MM + 5.0, y, BuiltinFont::Helvetica, COLOR_BLACK));
-    y -= 6.0;
-    ops.extend(text_ops(&format!("Range: {} - {} mg/dL", sorted[0] as u16, sorted[sorted.len()-1] as u16), 10.0, MARGIN_MM + 5.0, y, BuiltinFont::Helvetica, COLOR_BLACK));
-
-    // Footer
-    ops.extend(text_ops("Page 2 - Distribution Histogram", 8.0, MARGIN_MM, MARGIN_MM, BuiltinFont::Helvetica, COLOR_GRAY));
-
-    ops
-}
-
-fn build_hourly_page(
-    hourly_stats: &[HourlyStats],
-    low_threshold: u16,
-    high_threshold: u16,
-) -> Vec<Op> {
-    let mut ops = Vec::new();
-    let mut y = PAGE_HEIGHT_MM - MARGIN_MM;
-
-    // Title
-    ops.extend(text_ops("Glucose by Hour of Day", 16.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    y -= 8.0;
-    
-    let total_readings: usize = hourly_stats.iter().map(|h| h.count).sum();
-    ops.extend(text_ops(&format!("n = {} readings across 24 hours", total_readings), 10.0, MARGIN_MM, y, BuiltinFont::Helvetica, COLOR_GRAY));
-    y -= 15.0;
-
-    if hourly_stats.is_empty() {
-        ops.extend(text_ops("No hourly data available", 12.0, MARGIN_MM, y, BuiltinFont::Helvetica, COLOR_GRAY));
-        return ops;
-    }
-
-    // Chart area for boxplot
-    let chart_x = MARGIN_MM + 15.0;
-    let chart_y = y - 90.0;
-    let chart_width = PAGE_WIDTH_MM - 2.0 * MARGIN_MM - 20.0;
-    let chart_height = 70.0;
-
-    // Draw chart background
-    ops.extend(rect_fill_ops(chart_x, chart_y, chart_width, chart_height, COLOR_LIGHT_GRAY));
-    ops.extend(rect_stroke_ops(chart_x, chart_y, chart_width, chart_height, COLOR_BLACK, 0.5));
-
-    // Y-axis scale
-    let y_min = 40.0_f32;
-    let y_max = 300.0_f32;
-    let y_range = y_max - y_min;
-
-    // Draw threshold lines
-    let low_y_pos = chart_y + ((low_threshold as f32 - y_min) / y_range) * chart_height;
-    let high_y_pos = chart_y + ((high_threshold as f32 - y_min) / y_range) * chart_height;
-    ops.extend(line_ops(chart_x, low_y_pos, chart_x + chart_width, low_y_pos, COLOR_RED, 0.5));
-    ops.extend(line_ops(chart_x, high_y_pos, chart_x + chart_width, high_y_pos, COLOR_ORANGE, 0.5));
-
-    // Y-axis labels
-    for val in [50, 100, 150, 200, 250].iter() {
-        let label_y = chart_y + ((*val as f32 - y_min) / y_range) * chart_height;
-        ops.extend(text_ops(&format!("{}", val), 6.0, MARGIN_MM, label_y - 1.5, BuiltinFont::Helvetica, COLOR_GRAY));
-    }
-
-    // Draw boxplots for each hour
-    let box_width = chart_width / 26.0;
-    for stat in hourly_stats.iter() {
-        if stat.count == 0 {
-            continue;
+        if self.stats.histogram.is_empty() {
+            ops.extend(PdfOps::text("No data available", 12.0, MARGIN_MM, y, BuiltinFont::Helvetica, PdfColors::gray()));
+            ops.extend(PdfOps::text("Page 2 - Distribution Histogram", 8.0, MARGIN_MM, MARGIN_MM, BuiltinFont::Helvetica, PdfColors::gray()));
+            return PdfPage::new(Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), ops);
         }
 
-        let box_x = chart_x + (stat.hour as f32 + 1.0) * (chart_width / 25.0) - box_width / 2.0;
-        
-        // Calculate y positions
-        let min_y = chart_y + ((stat.min as f32 - y_min) / y_range) * chart_height;
-        let q1_y = chart_y + ((stat.q1 as f32 - y_min) / y_range) * chart_height;
-        let median_y = chart_y + ((stat.median as f32 - y_min) / y_range) * chart_height;
-        let q3_y = chart_y + ((stat.q3 as f32 - y_min) / y_range) * chart_height;
-        let max_y = chart_y + ((stat.max as f32 - y_min) / y_range) * chart_height;
+        // Chart area
+        let chart_x = MARGIN_MM + 15.0;
+        let chart_y = y - 100.0;
+        let chart_width = PAGE_WIDTH_MM - 2.0 * MARGIN_MM - 20.0;
+        let chart_height = 80.0;
 
-        // Whiskers
-        let whisker_x = box_x + box_width / 2.0;
-        ops.extend(line_ops(whisker_x, min_y, whisker_x, q1_y, COLOR_BLACK, 0.3));
-        ops.extend(line_ops(whisker_x, q3_y, whisker_x, max_y, COLOR_BLACK, 0.3));
+        ops.extend(PdfOps::rect_fill(chart_x, chart_y, chart_width, chart_height, PdfColors::light_gray()));
+        ops.extend(PdfOps::rect_stroke(chart_x, chart_y, chart_width, chart_height, PdfColors::black(), 0.5));
 
-        // Box
-        let box_height = q3_y - q1_y;
-        let box_color = if stat.mean < low_threshold as f64 {
-            COLOR_RED
-        } else if stat.mean > high_threshold as f64 {
-            COLOR_ORANGE
-        } else {
-            COLOR_GREEN
-        };
-        ops.extend(rect_fill_ops(box_x, q1_y, box_width, box_height.max(1.0), box_color));
-        ops.extend(rect_stroke_ops(box_x, q1_y, box_width, box_height.max(1.0), COLOR_BLACK, 0.3));
+        let max_count = self.stats.histogram.iter().map(|b| b.count).max().unwrap_or(1) as f32;
+        let num_bins = self.stats.histogram.len() as f32;
+        let bar_width = (chart_width - 10.0) / num_bins;
 
-        // Median line
-        ops.extend(line_ops(box_x, median_y, box_x + box_width, median_y, COLOR_BLACK, 0.8));
-    }
+        for (i, bin) in self.stats.histogram.iter().enumerate() {
+            let bar_height = (bin.count as f32 / max_count) * (chart_height - 10.0);
+            let bar_x_pos = chart_x + 5.0 + i as f32 * bar_width;
 
-    // X-axis labels (every 3 hours)
-    y = chart_y - 5.0;
-    for hour in (0..24).step_by(3) {
-        let label_x = chart_x + (hour as f32 + 1.0) * (chart_width / 25.0) - 3.0;
-        ops.extend(text_ops(&format!("{:02}:00", hour), 6.0, label_x, y, BuiltinFont::Helvetica, COLOR_BLACK));
-    }
-
-    y -= 20.0;
-
-    // Statistics table
-    ops.extend(text_ops("Hourly Statistics Summary", 12.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    y -= 10.0;
-
-    // Header
-    let col_x = [MARGIN_MM, MARGIN_MM + 20.0, MARGIN_MM + 40.0, MARGIN_MM + 70.0, MARGIN_MM + 100.0, MARGIN_MM + 130.0];
-    ops.extend(text_ops("Hour", 8.0, col_x[0], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    ops.extend(text_ops("n", 8.0, col_x[1], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    ops.extend(text_ops("Mean+/-SD", 8.0, col_x[2], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    ops.extend(text_ops("Median", 8.0, col_x[3], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    ops.extend(text_ops("IQR", 8.0, col_x[4], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    ops.extend(text_ops("Range", 8.0, col_x[5], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    y -= 5.0;
-    ops.extend(line_ops(MARGIN_MM, y, PAGE_WIDTH_MM - MARGIN_MM, y, COLOR_GRAY, 0.3));
-    y -= 5.0;
-
-    // Data rows (show hours with data)
-    for stat in hourly_stats.iter() {
-        if stat.count > 0 && y > MARGIN_MM + 15.0 {
-            ops.extend(text_ops(&format!("{:02}:00", stat.hour), 7.0, col_x[0], y, BuiltinFont::Helvetica, COLOR_BLACK));
-            ops.extend(text_ops(&format!("{}", stat.count), 7.0, col_x[1], y, BuiltinFont::Helvetica, COLOR_BLACK));
-            ops.extend(text_ops(&format!("{:.0}+/-{:.0}", stat.mean, stat.std_dev), 7.0, col_x[2], y, BuiltinFont::Helvetica, COLOR_BLACK));
-            ops.extend(text_ops(&format!("{}", stat.median), 7.0, col_x[3], y, BuiltinFont::Helvetica, COLOR_BLACK));
-            ops.extend(text_ops(&format!("{}-{}", stat.q1, stat.q3), 7.0, col_x[4], y, BuiltinFont::Helvetica, COLOR_BLACK));
-            ops.extend(text_ops(&format!("{}-{}", stat.min, stat.max), 7.0, col_x[5], y, BuiltinFont::Helvetica, COLOR_BLACK));
-            y -= 5.0;
-        }
-    }
-
-    // Footer
-    ops.extend(text_ops("Page 3 - Time of Day Analysis", 8.0, MARGIN_MM, MARGIN_MM, BuiltinFont::Helvetica, COLOR_GRAY));
-
-    ops
-}
-
-fn build_time_bins_page(
-    time_bin_stats: &[TimeBinStats],
-    low_threshold: u16,
-    high_threshold: u16,
-) -> Vec<Op> {
-    let mut ops = Vec::new();
-    let mut y = PAGE_HEIGHT_MM - MARGIN_MM;
-
-    // Title
-    ops.extend(text_ops("Glucose by Clinical Time Periods", 16.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    y -= 8.0;
-    ops.extend(text_ops("Boxplot analysis of clinically meaningful time windows", 10.0, MARGIN_MM, y, BuiltinFont::Helvetica, COLOR_GRAY));
-    y -= 15.0;
-
-    if time_bin_stats.is_empty() {
-        ops.extend(text_ops("No time bin data available", 12.0, MARGIN_MM, y, BuiltinFont::Helvetica, COLOR_GRAY));
-        return ops;
-    }
-
-    // Chart area
-    let chart_x = MARGIN_MM + 15.0;
-    let chart_y = y - 90.0;
-    let chart_width = PAGE_WIDTH_MM - 2.0 * MARGIN_MM - 20.0;
-    let chart_height = 70.0;
-
-    ops.extend(rect_fill_ops(chart_x, chart_y, chart_width, chart_height, COLOR_LIGHT_GRAY));
-    ops.extend(rect_stroke_ops(chart_x, chart_y, chart_width, chart_height, COLOR_BLACK, 0.5));
-
-    let y_min = 40.0_f32;
-    let y_max = 300.0_f32;
-    let y_range = y_max - y_min;
-
-    // Threshold lines
-    let low_y_pos = chart_y + ((low_threshold as f32 - y_min) / y_range) * chart_height;
-    let high_y_pos = chart_y + ((high_threshold as f32 - y_min) / y_range) * chart_height;
-    ops.extend(line_ops(chart_x, low_y_pos, chart_x + chart_width, low_y_pos, COLOR_RED, 0.5));
-    ops.extend(line_ops(chart_x, high_y_pos, chart_x + chart_width, high_y_pos, COLOR_ORANGE, 0.5));
-
-    // Y-axis labels
-    for val in [50, 100, 150, 200, 250].iter() {
-        let label_y = chart_y + ((*val as f32 - y_min) / y_range) * chart_height;
-        ops.extend(text_ops(&format!("{}", val), 6.0, MARGIN_MM, label_y - 1.5, BuiltinFont::Helvetica, COLOR_GRAY));
-    }
-
-    // Draw boxplots
-    let num_bins = time_bin_stats.len();
-    let box_width = chart_width / (num_bins + 2) as f32;
-
-    for (i, stat) in time_bin_stats.iter().enumerate() {
-        if stat.count == 0 {
-            continue;
-        }
-
-        let box_x = chart_x + (i as f32 + 1.0) * box_width;
-        
-        let min_y = chart_y + ((stat.min as f32 - y_min) / y_range) * chart_height;
-        let q1_y = chart_y + ((stat.q1 as f32 - y_min) / y_range) * chart_height;
-        let median_y = chart_y + ((stat.median as f32 - y_min) / y_range) * chart_height;
-        let q3_y = chart_y + ((stat.q3 as f32 - y_min) / y_range) * chart_height;
-        let max_y = chart_y + ((stat.max as f32 - y_min) / y_range) * chart_height;
-
-        // Whiskers
-        let whisker_x = box_x + box_width / 2.0;
-        ops.extend(line_ops(whisker_x, min_y, whisker_x, q1_y, COLOR_BLACK, 0.3));
-        ops.extend(line_ops(whisker_x, q3_y, whisker_x, max_y, COLOR_BLACK, 0.3));
-
-        // Box
-        let box_height = q3_y - q1_y;
-        let box_color = if stat.mean < low_threshold as f64 {
-            COLOR_RED
-        } else if stat.mean > high_threshold as f64 {
-            COLOR_ORANGE
-        } else {
-            COLOR_GREEN
-        };
-        ops.extend(rect_fill_ops(box_x, q1_y, box_width * 0.8, box_height.max(1.0), box_color));
-        ops.extend(rect_stroke_ops(box_x, q1_y, box_width * 0.8, box_height.max(1.0), COLOR_BLACK, 0.3));
-
-        // Median line
-        ops.extend(line_ops(box_x, median_y, box_x + box_width * 0.8, median_y, COLOR_BLACK, 0.8));
-    }
-
-    // X-axis labels
-    y = chart_y - 5.0;
-    for (i, stat) in time_bin_stats.iter().enumerate() {
-        let label_x = chart_x + (i as f32 + 1.0) * box_width;
-        ops.extend(text_ops(&stat.name, 6.0, label_x, y, BuiltinFont::Helvetica, COLOR_BLACK));
-    }
-
-    y -= 20.0;
-
-    // Statistics table
-    ops.extend(text_ops("Time Period Statistics (with 95% CI)", 12.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    y -= 10.0;
-
-    // Header
-    let col_x = [MARGIN_MM, MARGIN_MM + 30.0, MARGIN_MM + 50.0, MARGIN_MM + 65.0, MARGIN_MM + 95.0, MARGIN_MM + 120.0, MARGIN_MM + 145.0];
-    ops.extend(text_ops("Period", 8.0, col_x[0], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    ops.extend(text_ops("Hours", 8.0, col_x[1], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    ops.extend(text_ops("n", 8.0, col_x[2], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    ops.extend(text_ops("Mean+/-SD", 8.0, col_x[3], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    ops.extend(text_ops("Median", 8.0, col_x[4], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    ops.extend(text_ops("IQR", 8.0, col_x[5], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    ops.extend(text_ops("95% CI", 8.0, col_x[6], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    y -= 5.0;
-    ops.extend(line_ops(MARGIN_MM, y, PAGE_WIDTH_MM - MARGIN_MM, y, COLOR_GRAY, 0.3));
-    y -= 6.0;
-
-    for stat in time_bin_stats {
-        let value_color = get_reading_color(stat.mean as u16, low_threshold, high_threshold);
-        ops.extend(text_ops(&stat.name, 7.0, col_x[0], y, BuiltinFont::Helvetica, COLOR_BLACK));
-        ops.extend(text_ops(&stat.description, 7.0, col_x[1], y, BuiltinFont::Helvetica, COLOR_GRAY));
-        ops.extend(text_ops(&format!("{}", stat.count), 7.0, col_x[2], y, BuiltinFont::Helvetica, COLOR_BLACK));
-        
-        if stat.count > 0 {
-            ops.extend(text_ops(&format!("{:.0}+/-{:.0}", stat.mean, stat.std_dev), 7.0, col_x[3], y, BuiltinFont::Helvetica, value_color));
-            ops.extend(text_ops(&format!("{}", stat.median), 7.0, col_x[4], y, BuiltinFont::Helvetica, COLOR_BLACK));
-            ops.extend(text_ops(&format!("{}-{}", stat.q1, stat.q3), 7.0, col_x[5], y, BuiltinFont::Helvetica, COLOR_BLACK));
-            
-            if stat.count > 1 {
-                let se = stat.std_dev / (stat.count as f64).sqrt();
-                let ci_low = stat.mean - 1.96 * se;
-                let ci_high = stat.mean + 1.96 * se;
-                ops.extend(text_ops(&format!("{:.0}-{:.0}", ci_low, ci_high), 7.0, col_x[6], y, BuiltinFont::Helvetica, COLOR_BLACK));
+            let color = if bin.range_end <= self.thresholds.low_mgdl {
+                PdfColors::red()
+            } else if bin.range_start >= self.thresholds.high_mgdl {
+                PdfColors::orange()
             } else {
-                ops.extend(text_ops("-", 7.0, col_x[6], y, BuiltinFont::Helvetica, COLOR_GRAY));
+                PdfColors::green()
+            };
+
+            if bin.count > 0 {
+                ops.extend(PdfOps::rect_fill(bar_x_pos, chart_y + 5.0, bar_width * 0.9, bar_height, color));
+                ops.extend(PdfOps::rect_stroke(bar_x_pos, chart_y + 5.0, bar_width * 0.9, bar_height, PdfColors::black(), 0.3));
             }
-        } else {
-            ops.extend(text_ops("-", 7.0, col_x[3], y, BuiltinFont::Helvetica, COLOR_GRAY));
-            ops.extend(text_ops("-", 7.0, col_x[4], y, BuiltinFont::Helvetica, COLOR_GRAY));
-            ops.extend(text_ops("-", 7.0, col_x[5], y, BuiltinFont::Helvetica, COLOR_GRAY));
-            ops.extend(text_ops("-", 7.0, col_x[6], y, BuiltinFont::Helvetica, COLOR_GRAY));
         }
-        y -= 7.0;
+
+        // X-axis labels - show in user's preferred unit
+        y = chart_y - 5.0;
+        for (i, bin) in self.stats.histogram.iter().enumerate() {
+            if i % 4 == 0 {
+                let label_x = chart_x + 5.0 + i as f32 * bar_width;
+                let label = match self.unit {
+                    GlucoseUnit::MgDl => format!("{}", bin.range_start),
+                    GlucoseUnit::MmolL => format!("{:.1}", bin.range_start as f64 / 18.0),
+                };
+                ops.extend(PdfOps::text(&label, 6.0, label_x, y, BuiltinFont::Helvetica, PdfColors::black()));
+            }
+        }
+        ops.extend(PdfOps::text(self.unit.label(), 8.0, chart_x + chart_width / 2.0 - 10.0, y - 8.0, BuiltinFont::Helvetica, PdfColors::black()));
+        
+        y -= 25.0;
+
+        // Statistics
+        ops.extend(PdfOps::text("Distribution Statistics", 12.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, PdfColors::black()));
+        y -= 10.0;
+
+        let stats = &self.stats.basic;
+        let (mean_str, ci_str, median_str, sd_str, range_str) = match self.unit {
+            GlucoseUnit::MgDl => {
+                let (ci_low, ci_high) = stats.mgdl.confidence_interval_95();
+                (
+                    format!("Mean: {:.1} mg/dL", stats.mgdl.mean),
+                    format!("95% CI: {:.1} - {:.1} mg/dL", ci_low, ci_high),
+                    format!("Median: {} mg/dL", stats.mgdl.median),
+                    format!("Standard Deviation: {:.1} mg/dL", stats.mgdl.std_dev),
+                    format!("Range: {} - {} mg/dL", stats.mgdl.min, stats.mgdl.max),
+                )
+            }
+            GlucoseUnit::MmolL => {
+                let (ci_low, ci_high) = stats.mmol.confidence_interval_95();
+                (
+                    format!("Mean: {:.2} mmol/L", stats.mmol.mean),
+                    format!("95% CI: {:.2} - {:.2} mmol/L", ci_low, ci_high),
+                    format!("Median: {:.1} mmol/L", stats.mmol.median),
+                    format!("Standard Deviation: {:.2} mmol/L", stats.mmol.std_dev),
+                    format!("Range: {:.1} - {:.1} mmol/L", stats.mmol.min, stats.mmol.max),
+                )
+            }
+        };
+
+        ops.extend(PdfOps::text(&mean_str, 10.0, MARGIN_MM + 5.0, y, BuiltinFont::Helvetica, PdfColors::black()));
+        y -= 6.0;
+        ops.extend(PdfOps::text(&ci_str, 10.0, MARGIN_MM + 5.0, y, BuiltinFont::Helvetica, PdfColors::black()));
+        y -= 6.0;
+        ops.extend(PdfOps::text(&median_str, 10.0, MARGIN_MM + 5.0, y, BuiltinFont::Helvetica, PdfColors::black()));
+        y -= 6.0;
+        ops.extend(PdfOps::text(&sd_str, 10.0, MARGIN_MM + 5.0, y, BuiltinFont::Helvetica, PdfColors::black()));
+        y -= 6.0;
+        ops.extend(PdfOps::text(&range_str, 10.0, MARGIN_MM + 5.0, y, BuiltinFont::Helvetica, PdfColors::black()));
+
+        ops.extend(PdfOps::text("Page 2 - Distribution Histogram", 8.0, MARGIN_MM, MARGIN_MM, BuiltinFont::Helvetica, PdfColors::gray()));
+
+        PdfPage::new(Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), ops)
     }
 
-    // Footer
-    ops.extend(text_ops("Page 4 - Clinical Time Periods", 8.0, MARGIN_MM, MARGIN_MM, BuiltinFont::Helvetica, COLOR_GRAY));
+    fn build_hourly_page(&self) -> PdfPage {
+        let mut ops = Vec::new();
+        let mut y = PAGE_HEIGHT_MM - MARGIN_MM;
 
-    ops
-}
+        ops.extend(PdfOps::text("Glucose by Hour of Day", 16.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, PdfColors::black()));
+        y -= 8.0;
+        
+        let total_readings: usize = self.stats.hourly.iter().map(|h| h.count()).sum();
+        ops.extend(PdfOps::text(&format!("n = {} readings across 24 hours", total_readings), 10.0, MARGIN_MM, y, BuiltinFont::Helvetica, PdfColors::gray()));
+        y -= 15.0;
 
-fn build_daily_tir_page(
-    daily_tir: &[DailyTIR],
-    low_threshold: u16,
-    high_threshold: u16,
-) -> Vec<Op> {
-    let mut ops = Vec::new();
-    let mut y = PAGE_HEIGHT_MM - MARGIN_MM;
+        // Chart area for boxplot
+        let chart_x = MARGIN_MM + 15.0;
+        let chart_y = y - 90.0;
+        let chart_width = PAGE_WIDTH_MM - 2.0 * MARGIN_MM - 20.0;
+        let chart_height = 70.0;
 
-    // Title
-    ops.extend(text_ops("Daily Time-in-Range Trend", 16.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    y -= 8.0;
-    ops.extend(text_ops(&format!("Target range: {}-{} mg/dL | n = {} days", low_threshold, high_threshold, daily_tir.len()), 10.0, MARGIN_MM, y, BuiltinFont::Helvetica, COLOR_GRAY));
-    y -= 15.0;
+        ops.extend(PdfOps::rect_fill(chart_x, chart_y, chart_width, chart_height, PdfColors::light_gray()));
+        ops.extend(PdfOps::rect_stroke(chart_x, chart_y, chart_width, chart_height, PdfColors::black(), 0.5));
 
-    if daily_tir.is_empty() {
-        ops.extend(text_ops("No daily TIR data available", 12.0, MARGIN_MM, y, BuiltinFont::Helvetica, COLOR_GRAY));
-        return ops;
+        let (y_min, y_max) = self.y_range();
+        let y_range = y_max - y_min;
+
+        // Threshold lines
+        let low_y_pos = chart_y + ((self.threshold_low() - y_min) / y_range) * chart_height;
+        let high_y_pos = chart_y + ((self.threshold_high() - y_min) / y_range) * chart_height;
+        ops.extend(PdfOps::line(chart_x, low_y_pos, chart_x + chart_width, low_y_pos, PdfColors::red(), 0.5));
+        ops.extend(PdfOps::line(chart_x, high_y_pos, chart_x + chart_width, high_y_pos, PdfColors::orange(), 0.5));
+
+        // Y-axis labels
+        match self.unit {
+            GlucoseUnit::MgDl => {
+                for val in MGDL_AXIS_LABELS {
+                    let label_y = chart_y + ((val as f32 - y_min) / y_range) * chart_height;
+                    ops.extend(PdfOps::text(&format!("{}", val), 6.0, MARGIN_MM, label_y - 1.5, BuiltinFont::Helvetica, PdfColors::gray()));
+                }
+            }
+            GlucoseUnit::MmolL => {
+                for val in MMOL_AXIS_LABELS {
+                    let label_y = chart_y + ((val - y_min) / y_range) * chart_height;
+                    ops.extend(PdfOps::text(&format!("{:.0}", val), 6.0, MARGIN_MM, label_y - 1.5, BuiltinFont::Helvetica, PdfColors::gray()));
+                }
+            }
+        }
+
+        // Boxplots
+        let box_width = chart_width / 26.0;
+        for stat in &self.stats.hourly {
+            if let Some(ref s) = stat.stats {
+                let box_x_pos = chart_x + (stat.hour as f32 + 1.0) * (chart_width / 25.0) - box_width / 2.0;
+                
+                let (min_val, q1_val, median_val, q3_val, max_val) = match self.unit {
+                    GlucoseUnit::MgDl => (
+                        s.mgdl.min as f32, s.mgdl.q1 as f32, s.mgdl.median as f32, 
+                        s.mgdl.q3 as f32, s.mgdl.max as f32
+                    ),
+                    GlucoseUnit::MmolL => (
+                        s.mmol.min as f32, s.mmol.q1 as f32, s.mmol.median as f32,
+                        s.mmol.q3 as f32, s.mmol.max as f32
+                    ),
+                };
+                
+                let min_y = chart_y + ((min_val - y_min) / y_range) * chart_height;
+                let q1_y = chart_y + ((q1_val - y_min) / y_range) * chart_height;
+                let median_y = chart_y + ((median_val - y_min) / y_range) * chart_height;
+                let q3_y = chart_y + ((q3_val - y_min) / y_range) * chart_height;
+                let max_y = chart_y + ((max_val - y_min) / y_range) * chart_height;
+
+                // Whiskers
+                let whisker_x = box_x_pos + box_width / 2.0;
+                ops.extend(PdfOps::line(whisker_x, min_y, whisker_x, q1_y, PdfColors::black(), 0.3));
+                ops.extend(PdfOps::line(whisker_x, q3_y, whisker_x, max_y, PdfColors::black(), 0.3));
+
+                // Box
+                let box_height = (q3_y - q1_y).max(1.0);
+                let box_color = self.value_color(s.mgdl.mean as u16, s.mmol.mean);
+                ops.extend(PdfOps::rect_fill(box_x_pos, q1_y, box_width, box_height, box_color));
+                ops.extend(PdfOps::rect_stroke(box_x_pos, q1_y, box_width, box_height, PdfColors::black(), 0.3));
+
+                // Median line
+                ops.extend(PdfOps::line(box_x_pos, median_y, box_x_pos + box_width, median_y, PdfColors::black(), 0.8));
+            }
+        }
+
+        // X-axis labels
+        y = chart_y - 5.0;
+        for hour in (0..24).step_by(3) {
+            let label_x = chart_x + (hour as f32 + 1.0) * (chart_width / 25.0) - 3.0;
+            ops.extend(PdfOps::text(&format!("{:02}:00", hour), 6.0, label_x, y, BuiltinFont::Helvetica, PdfColors::black()));
+        }
+
+        ops.extend(PdfOps::text("Page 3 - Time of Day Analysis", 8.0, MARGIN_MM, MARGIN_MM, BuiltinFont::Helvetica, PdfColors::gray()));
+
+        PdfPage::new(Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), ops)
     }
 
-    // TIR trend chart
-    let chart_x = MARGIN_MM + 15.0;
-    let chart_y = y - 70.0;
-    let chart_width = PAGE_WIDTH_MM - 2.0 * MARGIN_MM - 20.0;
-    let chart_height = 50.0;
+    fn build_time_bins_page(&self) -> PdfPage {
+        let mut ops = Vec::new();
+        let mut y = PAGE_HEIGHT_MM - MARGIN_MM;
 
-    ops.extend(rect_fill_ops(chart_x, chart_y, chart_width, chart_height, COLOR_LIGHT_GRAY));
-    ops.extend(rect_stroke_ops(chart_x, chart_y, chart_width, chart_height, COLOR_BLACK, 0.5));
+        ops.extend(PdfOps::text("Glucose by Clinical Time Periods", 16.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, PdfColors::black()));
+        y -= 8.0;
+        ops.extend(PdfOps::text("Boxplot analysis of clinically meaningful time windows", 10.0, MARGIN_MM, y, BuiltinFont::Helvetica, PdfColors::gray()));
+        y -= 15.0;
 
-    // 70% goal line
-    let goal_y = chart_y + 0.7 * chart_height;
-    ops.extend(line_ops(chart_x, goal_y, chart_x + chart_width, goal_y, COLOR_GRAY, 0.5));
-    ops.extend(text_ops("70%", 6.0, MARGIN_MM, goal_y - 1.5, BuiltinFont::Helvetica, COLOR_GRAY));
+        let chart_x = MARGIN_MM + 15.0;
+        let chart_y = y - 90.0;
+        let chart_width = PAGE_WIDTH_MM - 2.0 * MARGIN_MM - 20.0;
+        let chart_height = 70.0;
 
-    // Y-axis labels
-    ops.extend(text_ops("0%", 6.0, MARGIN_MM, chart_y - 1.5, BuiltinFont::Helvetica, COLOR_GRAY));
-    ops.extend(text_ops("100%", 6.0, MARGIN_MM, chart_y + chart_height - 1.5, BuiltinFont::Helvetica, COLOR_GRAY));
+        ops.extend(PdfOps::rect_fill(chart_x, chart_y, chart_width, chart_height, PdfColors::light_gray()));
+        ops.extend(PdfOps::rect_stroke(chart_x, chart_y, chart_width, chart_height, PdfColors::black(), 0.5));
 
-    // Draw TIR line
-    let n = daily_tir.len();
-    if n > 1 {
-        let x_step = chart_width / (n - 1) as f32;
-        for i in 0..n - 1 {
-            let x1 = chart_x + i as f32 * x_step;
-            let x2 = chart_x + (i + 1) as f32 * x_step;
-            let y1 = chart_y + (daily_tir[i].in_range_pct as f32 / 100.0) * chart_height;
-            let y2 = chart_y + (daily_tir[i + 1].in_range_pct as f32 / 100.0) * chart_height;
-            ops.extend(line_ops(x1, y1, x2, y2, COLOR_GREEN, 1.0));
+        let (y_min, y_max) = self.y_range();
+        let y_range = y_max - y_min;
+
+        // Threshold lines
+        let low_y_pos = chart_y + ((self.threshold_low() - y_min) / y_range) * chart_height;
+        let high_y_pos = chart_y + ((self.threshold_high() - y_min) / y_range) * chart_height;
+        ops.extend(PdfOps::line(chart_x, low_y_pos, chart_x + chart_width, low_y_pos, PdfColors::red(), 0.5));
+        ops.extend(PdfOps::line(chart_x, high_y_pos, chart_x + chart_width, high_y_pos, PdfColors::orange(), 0.5));
+
+        // Y-axis labels
+        match self.unit {
+            GlucoseUnit::MgDl => {
+                for val in MGDL_AXIS_LABELS {
+                    let label_y = chart_y + ((val as f32 - y_min) / y_range) * chart_height;
+                    ops.extend(PdfOps::text(&format!("{}", val), 6.0, MARGIN_MM, label_y - 1.5, BuiltinFont::Helvetica, PdfColors::gray()));
+                }
+            }
+            GlucoseUnit::MmolL => {
+                for val in MMOL_AXIS_LABELS {
+                    let label_y = chart_y + ((val - y_min) / y_range) * chart_height;
+                    ops.extend(PdfOps::text(&format!("{:.0}", val), 6.0, MARGIN_MM, label_y - 1.5, BuiltinFont::Helvetica, PdfColors::gray()));
+                }
+            }
         }
-        
-        // Draw points
-        for i in 0..n {
-            let x = chart_x + i as f32 * x_step;
-            let y_pos = chart_y + (daily_tir[i].in_range_pct as f32 / 100.0) * chart_height;
-            let color = if daily_tir[i].in_range_pct >= 70.0 { COLOR_GREEN } else { COLOR_ORANGE };
-            ops.extend(point_ops(x, y_pos, 1.5, color));
+
+        // Boxplots
+        let num_bins = self.stats.time_bins.len();
+        let box_width = chart_width / (num_bins + 2) as f32;
+
+        for (i, stat) in self.stats.time_bins.iter().enumerate() {
+            if let Some(ref s) = stat.stats {
+                let box_x_pos = chart_x + (i as f32 + 1.0) * box_width;
+                
+                let (min_val, q1_val, median_val, q3_val, max_val) = match self.unit {
+                    GlucoseUnit::MgDl => (
+                        s.mgdl.min as f32, s.mgdl.q1 as f32, s.mgdl.median as f32, 
+                        s.mgdl.q3 as f32, s.mgdl.max as f32
+                    ),
+                    GlucoseUnit::MmolL => (
+                        s.mmol.min as f32, s.mmol.q1 as f32, s.mmol.median as f32,
+                        s.mmol.q3 as f32, s.mmol.max as f32
+                    ),
+                };
+                
+                let min_y = chart_y + ((min_val - y_min) / y_range) * chart_height;
+                let q1_y = chart_y + ((q1_val - y_min) / y_range) * chart_height;
+                let median_y = chart_y + ((median_val - y_min) / y_range) * chart_height;
+                let q3_y = chart_y + ((q3_val - y_min) / y_range) * chart_height;
+                let max_y = chart_y + ((max_val - y_min) / y_range) * chart_height;
+
+                // Whiskers
+                let whisker_x = box_x_pos + box_width / 2.0;
+                ops.extend(PdfOps::line(whisker_x, min_y, whisker_x, q1_y, PdfColors::black(), 0.3));
+                ops.extend(PdfOps::line(whisker_x, q3_y, whisker_x, max_y, PdfColors::black(), 0.3));
+
+                // Box
+                let box_height = (q3_y - q1_y).max(1.0);
+                let box_color = self.value_color(s.mgdl.mean as u16, s.mmol.mean);
+                ops.extend(PdfOps::rect_fill(box_x_pos, q1_y, box_width * 0.8, box_height, box_color));
+                ops.extend(PdfOps::rect_stroke(box_x_pos, q1_y, box_width * 0.8, box_height, PdfColors::black(), 0.3));
+
+                // Median line
+                ops.extend(PdfOps::line(box_x_pos, median_y, box_x_pos + box_width * 0.8, median_y, PdfColors::black(), 0.8));
+            }
         }
+
+        // X-axis labels
+        y = chart_y - 5.0;
+        for (i, stat) in self.stats.time_bins.iter().enumerate() {
+            let label_x = chart_x + (i as f32 + 1.0) * box_width;
+            ops.extend(PdfOps::text(&stat.name, 6.0, label_x, y, BuiltinFont::Helvetica, PdfColors::black()));
+        }
+
+        ops.extend(PdfOps::text("Page 4 - Clinical Time Periods", 8.0, MARGIN_MM, MARGIN_MM, BuiltinFont::Helvetica, PdfColors::gray()));
+
+        PdfPage::new(Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), ops)
     }
 
-    y = chart_y - 10.0;
+    fn build_daily_tir_page(&self) -> PdfPage {
+        let mut ops = Vec::new();
+        let mut y = PAGE_HEIGHT_MM - MARGIN_MM;
 
-    // Summary stats
-    let avg_tir: f64 = daily_tir.iter().map(|d| d.in_range_pct).sum::<f64>() / daily_tir.len() as f64;
-    let days_at_goal = daily_tir.iter().filter(|d| d.in_range_pct >= 70.0).count();
-    
-    ops.extend(text_ops(&format!("Average TIR: {:.1}%", avg_tir), 10.0, MARGIN_MM, y, BuiltinFont::Helvetica, COLOR_BLACK));
-    ops.extend(text_ops(&format!("Days at >=70% goal: {}/{} ({:.1}%)", days_at_goal, daily_tir.len(), (days_at_goal as f64 / daily_tir.len() as f64) * 100.0), 10.0, MARGIN_MM + 60.0, y, BuiltinFont::Helvetica, COLOR_BLACK));
+        ops.extend(PdfOps::text("Daily Time-in-Range Trend", 16.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, PdfColors::black()));
+        y -= 8.0;
+        
+        let range_str = self.thresholds.format_range(self.unit);
+        ops.extend(PdfOps::text(&format!("Target range: {} | n = {} days", range_str, self.stats.daily.len()), 10.0, MARGIN_MM, y, BuiltinFont::Helvetica, PdfColors::gray()));
+        y -= 15.0;
 
-    y -= 15.0;
-
-    // Daily details table
-    ops.extend(text_ops("Daily Time-in-Range Details", 12.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    y -= 10.0;
-
-    let col_x = [MARGIN_MM, MARGIN_MM + 30.0, MARGIN_MM + 50.0, MARGIN_MM + 80.0, MARGIN_MM + 110.0, MARGIN_MM + 140.0];
-    ops.extend(text_ops("Date", 8.0, col_x[0], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    ops.extend(text_ops("Count", 8.0, col_x[1], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    ops.extend(text_ops("Low %", 8.0, col_x[2], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    ops.extend(text_ops("In Range %", 8.0, col_x[3], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    ops.extend(text_ops("High %", 8.0, col_x[4], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    ops.extend(text_ops("Goal", 8.0, col_x[5], y, BuiltinFont::HelveticaBold, COLOR_BLACK));
-    y -= 5.0;
-    ops.extend(line_ops(MARGIN_MM, y, PAGE_WIDTH_MM - MARGIN_MM, y, COLOR_GRAY, 0.3));
-    y -= 5.0;
-
-    for day in daily_tir.iter().rev().take(25) {  // Show most recent 25 days
-        if y < MARGIN_MM + 15.0 {
-            break;
+        if self.stats.daily.is_empty() {
+            ops.extend(PdfOps::text("No daily TIR data available", 12.0, MARGIN_MM, y, BuiltinFont::Helvetica, PdfColors::gray()));
+            ops.extend(PdfOps::text("Page 5 - Daily TIR Trend", 8.0, MARGIN_MM, MARGIN_MM, BuiltinFont::Helvetica, PdfColors::gray()));
+            return PdfPage::new(Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), ops);
         }
+
+        // TIR trend chart
+        let chart_x = MARGIN_MM + 15.0;
+        let chart_y = y - 70.0;
+        let chart_width = PAGE_WIDTH_MM - 2.0 * MARGIN_MM - 20.0;
+        let chart_height = 50.0;
+
+        ops.extend(PdfOps::rect_fill(chart_x, chart_y, chart_width, chart_height, PdfColors::light_gray()));
+        ops.extend(PdfOps::rect_stroke(chart_x, chart_y, chart_width, chart_height, PdfColors::black(), 0.5));
+
+        // 70% goal line
+        let goal_y = chart_y + 0.7 * chart_height;
+        ops.extend(PdfOps::line(chart_x, goal_y, chart_x + chart_width, goal_y, PdfColors::gray(), 0.5));
+        ops.extend(PdfOps::text("70%", 6.0, MARGIN_MM, goal_y - 1.5, BuiltinFont::Helvetica, PdfColors::gray()));
+
+        // Y-axis labels
+        ops.extend(PdfOps::text("0%", 6.0, MARGIN_MM, chart_y - 1.5, BuiltinFont::Helvetica, PdfColors::gray()));
+        ops.extend(PdfOps::text("100%", 6.0, MARGIN_MM, chart_y + chart_height - 1.5, BuiltinFont::Helvetica, PdfColors::gray()));
+
+        // Draw TIR line
+        let n = self.stats.daily.len();
+        if n > 1 {
+            let x_step = chart_width / (n - 1) as f32;
+            for i in 0..n - 1 {
+                let x1 = chart_x + i as f32 * x_step;
+                let x2 = chart_x + (i + 1) as f32 * x_step;
+                let y1 = chart_y + (self.stats.daily[i].tir.in_range_percent() as f32 / 100.0) * chart_height;
+                let y2 = chart_y + (self.stats.daily[i + 1].tir.in_range_percent() as f32 / 100.0) * chart_height;
+                ops.extend(PdfOps::line(x1, y1, x2, y2, PdfColors::green(), 1.0));
+            }
+            
+            for i in 0..n {
+                let x = chart_x + i as f32 * x_step;
+                let y_pos = chart_y + (self.stats.daily[i].tir.in_range_percent() as f32 / 100.0) * chart_height;
+                let color = if self.stats.daily[i].tir.in_range_percent() >= 70.0 { PdfColors::green() } else { PdfColors::orange() };
+                ops.extend(PdfOps::point(x, y_pos, 1.5, color));
+            }
+        }
+
+        y = chart_y - 10.0;
+
+        // Summary stats
+        let avg_tir: f64 = self.stats.daily.iter().map(|d| d.tir.in_range_percent()).sum::<f64>() / self.stats.daily.len() as f64;
+        let days_at_goal = self.stats.daily.iter().filter(|d| d.tir.in_range_percent() >= 70.0).count();
         
-        ops.extend(text_ops(&day.date, 7.0, col_x[0], y, BuiltinFont::Helvetica, COLOR_BLACK));
-        ops.extend(text_ops(&format!("{}", day.total), 7.0, col_x[1], y, BuiltinFont::Helvetica, COLOR_BLACK));
-        ops.extend(text_ops(&format!("{:.1}%", day.low_pct), 7.0, col_x[2], y, BuiltinFont::Helvetica, COLOR_RED));
-        ops.extend(text_ops(&format!("{:.1}%", day.in_range_pct), 7.0, col_x[3], y, BuiltinFont::Helvetica, COLOR_GREEN));
-        ops.extend(text_ops(&format!("{:.1}%", day.high_pct), 7.0, col_x[4], y, BuiltinFont::Helvetica, COLOR_ORANGE));
-        
-        let goal_text = if day.in_range_pct >= 70.0 { "Yes" } else { "-" };
-        let goal_color = if day.in_range_pct >= 70.0 { COLOR_GREEN } else { COLOR_GRAY };
-        ops.extend(text_ops(goal_text, 7.0, col_x[5], y, BuiltinFont::Helvetica, goal_color));
-        
-        y -= 5.0;
+        ops.extend(PdfOps::text(&format!("Average TIR: {:.1}%", avg_tir), 10.0, MARGIN_MM, y, BuiltinFont::Helvetica, PdfColors::black()));
+        ops.extend(PdfOps::text(&format!("Days at >=70% goal: {}/{} ({:.1}%)", days_at_goal, self.stats.daily.len(), (days_at_goal as f64 / self.stats.daily.len() as f64) * 100.0), 10.0, MARGIN_MM + 60.0, y, BuiltinFont::Helvetica, PdfColors::black()));
+
+        ops.extend(PdfOps::text("Page 5 - Daily TIR Trend", 8.0, MARGIN_MM, MARGIN_MM, BuiltinFont::Helvetica, PdfColors::gray()));
+
+        PdfPage::new(Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), ops)
     }
 
-    // Footer
-    ops.extend(text_ops("Page 5 - Daily TIR Trend", 8.0, MARGIN_MM, MARGIN_MM, BuiltinFont::Helvetica, COLOR_GRAY));
+    fn build_chart_page(&self) -> PdfPage {
+        let mut ops = Vec::new();
+        let mut y = PAGE_HEIGHT_MM - MARGIN_MM;
 
-    ops
+        ops.extend(PdfOps::text("Glucose Trend Chart", 16.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, PdfColors::black()));
+        y -= 20.0;
+
+        if self.readings.is_empty() {
+            ops.extend(PdfOps::text("No data to display", 12.0, MARGIN_MM, y, BuiltinFont::Helvetica, PdfColors::gray()));
+            ops.extend(PdfOps::text("Page 6 - Glucose Trend Chart", 8.0, MARGIN_MM, MARGIN_MM, BuiltinFont::Helvetica, PdfColors::gray()));
+            return PdfPage::new(Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), ops);
+        }
+
+        let chart_x = MARGIN_MM + 15.0;
+        let chart_y = y - 120.0;
+        let chart_width = PAGE_WIDTH_MM - 2.0 * MARGIN_MM - 20.0;
+        let chart_height = 100.0;
+
+        ops.extend(PdfOps::rect_fill(chart_x, chart_y, chart_width, chart_height, PdfColors::light_gray()));
+        ops.extend(PdfOps::rect_stroke(chart_x, chart_y, chart_width, chart_height, PdfColors::black(), 0.5));
+
+        let (y_min, y_max) = self.y_range();
+        let y_range = y_max - y_min;
+
+        // Y-axis labels and grid
+        match self.unit {
+            GlucoseUnit::MgDl => {
+                for mg_dl in [50u16, 100, 150, 200, 250, 300] {
+                    let y_pos = chart_y + ((mg_dl as f32 - y_min) / y_range) * chart_height;
+                    if y_pos >= chart_y && y_pos <= chart_y + chart_height {
+                        ops.extend(PdfOps::line(chart_x, y_pos, chart_x + chart_width, y_pos, PdfColors::light_gray(), 0.3));
+                        ops.extend(PdfOps::text(&format!("{}", mg_dl), 7.0, MARGIN_MM, y_pos - 1.5, BuiltinFont::Helvetica, PdfColors::gray()));
+                    }
+                }
+            }
+            GlucoseUnit::MmolL => {
+                for mmol in [3.0f32, 5.0, 7.0, 10.0, 13.0, 16.0] {
+                    let y_pos = chart_y + ((mmol - y_min) / y_range) * chart_height;
+                    if y_pos >= chart_y && y_pos <= chart_y + chart_height {
+                        ops.extend(PdfOps::line(chart_x, y_pos, chart_x + chart_width, y_pos, PdfColors::light_gray(), 0.3));
+                        ops.extend(PdfOps::text(&format!("{:.0}", mmol), 7.0, MARGIN_MM, y_pos - 1.5, BuiltinFont::Helvetica, PdfColors::gray()));
+                    }
+                }
+            }
+        }
+
+        // Threshold lines
+        let low_y = chart_y + ((self.threshold_low() - y_min) / y_range) * chart_height;
+        let high_y = chart_y + ((self.threshold_high() - y_min) / y_range) * chart_height;
+        
+        ops.extend(PdfOps::line(chart_x, low_y, chart_x + chart_width, low_y, PdfColors::red(), 0.8));
+        ops.extend(PdfOps::line(chart_x, high_y, chart_x + chart_width, high_y, PdfColors::orange(), 0.8));
+
+        // Data points and lines
+        let n = self.readings.len();
+        if n > 1 {
+            let x_step = chart_width / (n - 1) as f32;
+            
+            for i in 0..n - 1 {
+                let x1 = chart_x + i as f32 * x_step;
+                let x2 = chart_x + (i + 1) as f32 * x_step;
+                let val1 = self.reading_value(&self.readings[i]);
+                let val2 = self.reading_value(&self.readings[i + 1]);
+                let y1 = chart_y + ((val1 - y_min) / y_range) * chart_height;
+                let y2 = chart_y + ((val2 - y_min) / y_range) * chart_height;
+                
+                let y1_clamped = y1.max(chart_y).min(chart_y + chart_height);
+                let y2_clamped = y2.max(chart_y).min(chart_y + chart_height);
+                
+                ops.extend(PdfOps::line(x1, y1_clamped, x2, y2_clamped, PdfColors::blue(), 0.8));
+            }
+
+            for i in 0..n {
+                let x = chart_x + i as f32 * x_step;
+                let val = self.reading_value(&self.readings[i]);
+                let y_val = ((val - y_min) / y_range) * chart_height;
+                let y_pos = (chart_y + y_val).max(chart_y).min(chart_y + chart_height);
+                let color = self.value_color(self.readings[i].mg_dl, self.readings[i].mmol_l);
+                ops.extend(PdfOps::point(x, y_pos, 1.5, color));
+            }
+        }
+
+        y = chart_y - 15.0;
+
+        // Legend
+        ops.extend(PdfOps::text("Legend:", 10.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, PdfColors::black()));
+        y -= 8.0;
+        
+        ops.extend(PdfOps::line(MARGIN_MM, y + 2.0, MARGIN_MM + 12.0, y + 2.0, PdfColors::blue(), 1.0));
+        ops.extend(PdfOps::text("Glucose readings", 9.0, MARGIN_MM + 15.0, y, BuiltinFont::Helvetica, PdfColors::black()));
+        
+        let low_label = match self.unit {
+            GlucoseUnit::MgDl => format!("Low ({})", self.thresholds.low_mgdl),
+            GlucoseUnit::MmolL => format!("Low ({:.1})", self.thresholds.low_mmol),
+        };
+        let high_label = match self.unit {
+            GlucoseUnit::MgDl => format!("High ({})", self.thresholds.high_mgdl),
+            GlucoseUnit::MmolL => format!("High ({:.1})", self.thresholds.high_mmol),
+        };
+        
+        ops.extend(PdfOps::line(MARGIN_MM + 70.0, y + 2.0, MARGIN_MM + 82.0, y + 2.0, PdfColors::red(), 1.0));
+        ops.extend(PdfOps::text(&low_label, 9.0, MARGIN_MM + 85.0, y, BuiltinFont::Helvetica, PdfColors::black()));
+        
+        ops.extend(PdfOps::line(MARGIN_MM + 130.0, y + 2.0, MARGIN_MM + 142.0, y + 2.0, PdfColors::orange(), 1.0));
+        ops.extend(PdfOps::text(&high_label, 9.0, MARGIN_MM + 145.0, y, BuiltinFont::Helvetica, PdfColors::black()));
+
+        ops.extend(PdfOps::text("Page 6 - Glucose Trend Chart", 8.0, MARGIN_MM, MARGIN_MM, BuiltinFont::Helvetica, PdfColors::gray()));
+
+        PdfPage::new(Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), ops)
+    }
+
+    fn build_data_page(&self, readings: &[StoredReading], page_num: usize, total_pages: usize) -> PdfPage {
+        let mut ops = Vec::new();
+        let mut y = PAGE_HEIGHT_MM - MARGIN_MM;
+
+        ops.extend(PdfOps::text("Glucose Readings", 14.0, MARGIN_MM, y, BuiltinFont::HelveticaBold, PdfColors::black()));
+        y -= 15.0;
+
+        let col_x = [MARGIN_MM, MARGIN_MM + 32.0, MARGIN_MM + 48.0, MARGIN_MM + 64.0, MARGIN_MM + 80.0, MARGIN_MM + 130.0];
+
+        // Header background
+        ops.extend(PdfOps::rect_fill(MARGIN_MM, y - 6.0, PAGE_WIDTH_MM - 2.0 * MARGIN_MM, 8.0, PdfColors::light_gray()));
+
+        // Column headers based on unit preference
+        let (col1_label, col2_label) = match self.unit {
+            GlucoseUnit::MgDl => ("mg/dL", "mmol/L"),
+            GlucoseUnit::MmolL => ("mmol/L", "mg/dL"),
+        };
+        
+        ops.extend(PdfOps::text("Date/Time", 8.0, col_x[0], y - 4.0, BuiltinFont::HelveticaBold, PdfColors::black()));
+        ops.extend(PdfOps::text(col1_label, 8.0, col_x[1], y - 4.0, BuiltinFont::HelveticaBold, PdfColors::black()));
+        ops.extend(PdfOps::text(col2_label, 8.0, col_x[2], y - 4.0, BuiltinFont::HelveticaBold, PdfColors::black()));
+        ops.extend(PdfOps::text("Status", 8.0, col_x[3], y - 4.0, BuiltinFont::HelveticaBold, PdfColors::black()));
+        ops.extend(PdfOps::text("Notes", 8.0, col_x[4], y - 4.0, BuiltinFont::HelveticaBold, PdfColors::black()));
+        ops.extend(PdfOps::text("Tags", 8.0, col_x[5], y - 4.0, BuiltinFont::HelveticaBold, PdfColors::black()));
+        y -= 10.0;
+
+        ops.extend(PdfOps::line(MARGIN_MM, y, PAGE_WIDTH_MM - MARGIN_MM, y, PdfColors::gray(), 0.5));
+        y -= 2.0;
+
+        // Data rows
+        for (row_idx, reading) in readings.iter().enumerate() {
+            let range = self.thresholds.classify(reading.mg_dl);
+            let status_color = PdfColors::for_range(range);
+
+            y -= 6.0;
+            
+            // Alternating row background
+            if row_idx % 2 == 1 {
+                ops.extend(PdfOps::rect_fill(MARGIN_MM, y - 1.5, PAGE_WIDTH_MM - 2.0 * MARGIN_MM, 7.0, PdfColors::light_gray()));
+            }
+            
+            let value_color = self.value_color(reading.mg_dl, reading.mmol_l);
+            
+            // Values in preferred unit order
+            let (val1, val2) = match self.unit {
+                GlucoseUnit::MgDl => (format!("{}", reading.mg_dl), format!("{:.2}", reading.mmol_l)),
+                GlucoseUnit::MmolL => (format!("{:.2}", reading.mmol_l), format!("{}", reading.mg_dl)),
+            };
+            
+            ops.extend(PdfOps::text(&reading.timestamp, 7.0, col_x[0], y, BuiltinFont::Helvetica, PdfColors::black()));
+            ops.extend(PdfOps::text(&val1, 7.0, col_x[1], y, BuiltinFont::Helvetica, value_color));
+            ops.extend(PdfOps::text(&val2, 7.0, col_x[2], y, BuiltinFont::Helvetica, PdfColors::black()));
+            ops.extend(PdfOps::text(range.status(), 7.0, col_x[3], y, BuiltinFont::Helvetica, status_color));
+            
+            let note = reading.note.as_deref().unwrap_or("-");
+            let note_display = if note.is_empty() { "-" } else if note.len() > 30 { &note[..30] } else { note };
+            ops.extend(PdfOps::text(note_display, 7.0, col_x[4], y, BuiltinFont::Helvetica, PdfColors::black()));
+            
+            let tags = reading.tags.as_deref().unwrap_or("-");
+            let tags_display = if tags.is_empty() { "-" } else { tags };
+            ops.extend(PdfOps::text(tags_display, 7.0, col_x[5], y, BuiltinFont::Helvetica, PdfColors::gray()));
+        }
+
+        ops.extend(PdfOps::text(&format!("Page {} of {} - Data", page_num + 6, total_pages + 6), 8.0, MARGIN_MM, MARGIN_MM, BuiltinFont::Helvetica, PdfColors::gray()));
+
+        PdfPage::new(Mm(PAGE_WIDTH_MM), Mm(PAGE_HEIGHT_MM), ops)
+    }
 }
