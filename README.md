@@ -13,7 +13,6 @@ cargo build --release
 
 ## Run
 
-# GUI (default)
 cargo run --release
 
 Windows (driver)
@@ -23,9 +22,11 @@ Windows (driver)
 - Debug (PowerShell): `$env:ACCUCHEK_DBG=1; .\target\release\accuchek.exe sync`
 
 # CLI examples
+```
 accuchek sync    # download from device and save to DB
 accuchek path    # show data/config locations
 accuchek help    # show CLI help
+```
 
 ## Data and Config
 Data directory is OS-specific (use `accuchek path` to view). Key files:
